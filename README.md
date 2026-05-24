@@ -10,18 +10,56 @@ Klaus' `my-*` toolchain conventions (config search path, `--config`,
 
 ## What it does
 
-| Action          | Source                              | Purpose                                       |
-| --------------- | ----------------------------------- | --------------------------------------------- |
-| *(no action)*   | parsed assertions + state file      | **Default**: culprits + what we've disabled   |
-| `status`        | `pmset -g`, `-g sched`, assertions  | Verbose overview                              |
-| `assertions`    | `pmset -g assertions`               | Raw dump                                      |
-| `culprits`      | parsed `pmset -g assertions`        | Compact table: PID / proc / assertion / label |
-| `wake-history`  | `pmset -g log`, `log show`          | Recent sleep/wake events & wake reasons       |
-| `scheduled`     | `pmset -g sched` + launchd plists   | Scheduled wakes (Time Machine, calendar, …)   |
-| `kill <SEL>`    | `kill(1)`                           | **One-shot** — launchd may restart            |
-| `prevent <SEL>` | `launchctl disable` + `bootout`     | **Persistent** — survives reboot              |
-| `restore <SEL>` | `launchctl enable` + `kickstart`    | Undo `prevent`                                |
-| `state`         | state file                          | What we've disabled (and when)                |
+| Action             | Source                              | Purpose                                          |
+| ------------------ | ----------------------------------- | ------------------------------------------------ |
+| *(no action)*      | parsed assertions + state + log     | **Default lean view**: culprits + prevented + last 10 power events |
+| `status`           | + `pmset -g`, `-g sched`            | Verbose superset of the default                  |
+| `assertions`       | `pmset -g assertions`               | Raw dump                                         |
+| `culprits`         | parsed `pmset -g assertions`        | Compact table: PID / proc / assertion / label    |
+| `wake-history`     | `pmset -g log`, `log show`          | **Narrative timeline** of the last N (default 10) power events |
+| `wake-history-raw` | `pmset -g log`                      | Underlying raw pmset log lines (escape hatch)    |
+| `scheduled`        | `pmset -g sched` + launchd plists   | Scheduled wakes (Time Machine, calendar, …)      |
+| `kill <SEL>`       | `kill(1)`                           | **One-shot** — launchd may restart               |
+| `prevent <SEL>`    | `launchctl disable` + `bootout`     | **Persistent** — survives reboot                 |
+| `restore <SEL>`    | `launchctl enable` + `kickstart`    | Undo `prevent`                                   |
+| `state`            | state file                          | What we've disabled (and when)                   |
+
+### `wake-history` — narrative timeline
+
+`wake-history` (and the tail of every default/`status` invocation) parses
+`pmset -g log` into a categorised stream of *real* power events, then
+shows the last N (default 10):
+
+```
+== last 10 power events (oldest first; "*" marks a power-state change) ==
+  *  2026-05-24 19:20:35    DISPLAY-OFF  Display turned OFF
+     2026-05-24 19:22:46    PREVENT-END  backupd-helper ended preventing idle sleep ("Mutexed Backup Block", held 00:00:30)
+     2026-05-24 19:26:00..19:40:57  NOTIF-WAKE   Display lit by NotificationCenter (x5)
+     2026-05-24 19:41:15    PREVENT-END  coreaudiod ended preventing idle sleep ("audio playback", held 00:00:34) (x7)
+  *  2026-05-24 20:06:39    DISPLAY-ON   Display turned ON
+  *  2026-05-24 20:22:00    DISPLAY-OFF  Display turned OFF
+  *  2026-05-24 20:24:12    DISPLAY-ON   Display turned ON
+```
+
+Categories: `DISPLAY-ON` / `DISPLAY-OFF` / `SLEEP` / `WAKE` / `HIBERNATE`
+/ `DARK-WAKE` (MaintenanceWake) / `DARK-PROBE` (powerd inactivity probe)
+/ `PREVENT` / `PREVENT-END` (sleep blockers started/ended) / `CAFFEINATE`
+(NoIdleSleep / NoDisplaySleep holds) / `NOTIF-WAKE` (NotificationCenter
+lighting the screen for a banner) / `BATTERY` (BatteryHealth notices).
+
+`*` flags "real" power-state transitions (display on/off, sleep, wake,
+hibernate, dark wake). Adjacent identical events are collapsed with
+`(xN)` and a time range. `coreaudiod`'s per-audio-channel assertions are
+normalised to `"audio playback"` so they collapse cleanly.
+
+`BackgroundTask`, `ApplePushServiceTask`, `NetworkClientActive`,
+`UserIsActive` and `Summary` lines are filtered as noise. The chatty
+`powerd` / `"Prevent sleep while display is on"` pair is dropped because
+it already maps 1:1 to the `DISPLAY-ON` / `DISPLAY-OFF` notifications.
+
+Override the count via `WAKE_HISTORY_EVENTS` in the config file. Use
+`wake-history-raw` if the narrative view is hiding something you want
+to see.
 
 ### Selectors
 
@@ -58,10 +96,12 @@ overridden] …`) so a `--force` in your shell history is never invisible.
 sudo install -m 0755 my-power-doctor /usr/local/bin/
 
 # first look — no changes
-my-power-doctor                       # default: culprits + state
-my-power-doctor status                # verbose overview
+my-power-doctor                       # default: culprits + state + last 10 power events
+my-power-doctor status                # verbose superset (+ pmset settings, scheduled wakes)
 my-power-doctor culprits              # just the culprit table
-sudo my-power-doctor wake-history     # full unified-log wake reasons (root only)
+my-power-doctor wake-history          # narrative timeline of last 10 power events
+my-power-doctor wake-history-raw      # raw pmset log lines (escape hatch)
+sudo my-power-doctor wake-history     # +full unified-log wake reasons (root only)
 
 # write the default config to your /LINKS/default
 my-power-doctor --create-config /LINKS/default/my-power-doctor.conf
@@ -126,8 +166,11 @@ WHITELIST="WindowServer loginwindow coreaudiod hidd \
            com.apple.WindowServer com.apple.loginwindow \
            NoDisplaySleepAssertion"
 
-# How many lines of wake-history to show by default
+# How many raw lines 'wake-history-raw' shows
 # WAKE_HISTORY_LINES=40
+
+# How many extracted power events 'wake-history' (and the default view) shows
+# WAKE_HISTORY_EVENTS=10
 ```
 
 The whitelist gets a `W` flag in the `culprits` view so you can see at a

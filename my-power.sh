@@ -36,7 +36,7 @@
 set -u
 
 PROG="my-power-doctor"
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ----------------------------------------------------------------------------
 # DEFAULTS (overridable by config file)
@@ -73,6 +73,12 @@ WHITELIST=""
 
 # How many lines of wake-history to show
 WAKE_HISTORY_LINES=40
+
+# How many extracted power events to show in 'wake-history' (narrative view).
+# Events are: display on/off, dark/maintenance wakes, sleep blockers started/ended,
+# battery health, hibernate/sleep transitions. Counts back across the full
+# pmset log regardless of age.
+WAKE_HISTORY_EVENTS=10
 
 # Config file resolution (first existing wins)
 CONFIG_SEARCH="/LINKS/default/my-power-doctor.conf ${HOME}/.my-power-doctor.conf /etc/my-power-doctor.conf /usr/local/etc/my-power-doctor.conf"
@@ -137,11 +143,22 @@ USAGE:
     $PROG [GLOBAL OPTS] <action> [args...]
 
 ACTIONS:
-    (no action)             Default. Active sleep blockers + prevented state.
-    status                  Verbose overview: settings, scheduled wakes, culprits.
+    (no action)             Default lean view: active sleep blockers +
+                            prevented services + the last N power events
+                            (default N=10, see WAKE_HISTORY_EVENTS).
+    status                  Verbose superset of the default: also includes
+                            host info, 'pmset -g' sleep settings, and
+                            scheduled wakes ('pmset -g sched').
     assertions              Full parsed dump of pmset -g assertions.
     culprits                Compact list of PID/name/label/assertion.
-    wake-history            Recent sleep/wake events & wake reasons.
+    wake-history            Narrative timeline of the last N (default 10)
+                            real power events extracted from pmset -g log
+                            (display on/off, dark/maintenance wakes, sleep
+                            blockers started/ended, hibernate, battery health).
+                            N is set by WAKE_HISTORY_EVENTS in the config.
+    wake-history-raw        Underlying raw pmset -g log lines (sleep|wake|
+                            assertion|battery), tail-N. Use when the narrative
+                            view is hiding something you want to see.
     scheduled               Scheduled wakes (pmset -g sched).
     kill <selector>         SIGTERM blocker(s). One-shot — launchd may restart.
     prevent <selector>      Persistently disable via launchctl.
@@ -234,6 +251,9 @@ WHITELIST="WindowServer loginwindow coreaudiod hidd \
 
 # How many lines of wake-history to show by default
 # WAKE_HISTORY_LINES=40
+
+# How many extracted power events to show in 'wake-history' (narrative view).
+# WAKE_HISTORY_EVENTS=10
 EOF
 }
 
@@ -391,12 +411,16 @@ pid_to_launchd() {
 # ----------------------------------------------------------------------------
 # DISPLAY: default / status / culprits / wake-history / scheduled
 # ----------------------------------------------------------------------------
-# Default action when no verb is given: the two pieces that answer
-# "is anything blocking sleep right now?" and "what have I disabled?".
+# Default action when no verb is given: the lean view —
+#   "is anything blocking sleep right now?", "what have I disabled?",
+#   "what just happened power-wise?".  No pmset settings / scheduled wakes
+#   header (use 'status' for that).
 action_default() {
     action_culprits
     printf '\n'
     action_state
+    printf '\n'
+    action_wake_history
 }
 
 action_status() {
@@ -419,16 +443,16 @@ action_status() {
     action_culprits
     printf '\n'
 
-    printf '== last wake reason ==\n'
-    pmset -g log 2>/dev/null \
-        | grep -iE 'wake[[:space:]]+(reason|from)' \
-        | tail -n 5 \
-        | sed 's/^/  /'
+    action_state
+    printf '\n'
+
+    action_wake_history
     printf '\n'
 
     printf 'Tip:  %s wake-history    %s prevent <name>    %s restore all\n' \
         "$PROG" "$PROG" "$PROG"
 }
+
 
 # Compact culprit list, one per line, with launchd label resolution.
 # Side-effect: writes $STATE_DIR/last-culprits.tsv so 'prevent N' works.
@@ -493,15 +517,245 @@ action_assertions() {
     pmset -g assertions 2>/dev/null
 }
 
+# Extract a narrative timeline of "real" power events from pmset -g log
+# (display on/off, sleep blockers started/ended, dark/maintenance wakes,
+# hibernate transitions, battery-health notices). One row per event,
+# TAB-separated:  TIMESTAMP \t CATEGORY \t DESCRIPTION
+# Writes to stdout; designed to be tail-clipped by the caller.
+extract_power_events() {
+    _src="$1"   # path to captured pmset -g log
+    awk '
+        # ----- helpers -----
+        function ts(s)         { return substr(s, 1, 19) }
+        function strip_q(s)    { gsub(/^"|"$/, "", s); return s }
+        function action_verb(a) {
+            if (a == "Created")  return "started"
+            if (a == "Released") return "ended"
+            if (a == "TimedOut") return "timed out"
+            return a
+        }
+
+        # ----- Notification: display backlight toggles -----
+        /^[0-9]{4}-[0-9]{2}-[0-9]{2}.*Notification.*Display is turned on/ {
+            printf "%s\tDISPLAY-ON\tDisplay turned ON\n", ts($0); next
+        }
+        /^[0-9]{4}-[0-9]{2}-[0-9]{2}.*Notification.*Display is turned off/ {
+            printf "%s\tDISPLAY-OFF\tDisplay turned OFF\n", ts($0); next
+        }
+
+        # ----- Notification: explicit Sleep / Wake / Hibernate lines     -----
+        # ----- (present on some macOS releases, absent on others)        -----
+        /^[0-9]{4}-[0-9]{2}-[0-9]{2}.*Notification.*(Entering Sleep|Going to sleep)/ {
+            printf "%s\tSLEEP\tSystem entering sleep\n", ts($0); next
+        }
+        /^[0-9]{4}-[0-9]{2}-[0-9]{2}.*Notification.*(Wake from|Waking from sleep)/ {
+            line = $0
+            sub(/.*Notification[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            printf "%s\tWAKE\t%s\n", ts($0), line; next
+        }
+        /^[0-9]{4}-[0-9]{2}-[0-9]{2}.*(Hibernate|hibernat)/ {
+            line = $0
+            sub(/.*(Notification|Assertions|Sleep)[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            printf "%s\tHIBERNATE\t%s\n", ts($0), line; next
+        }
+
+        # ----- BatteryHealth -----
+        /^[0-9]{4}-[0-9]{2}-[0-9]{2}.*BatteryHealth/ {
+            _ts = ts($0); msg = $0
+            sub(/.*BatteryHealth[[:space:]]+/, "", msg)
+            sub(/[[:space:]]+$/, "", msg)
+            printf "%s\tBATTERY\tBattery: %s\n", _ts, msg
+            next
+        }
+
+        # ----- Assertions: parse PID, proc, action, type, named, held -----
+        /^[0-9]{4}-[0-9]{2}-[0-9]{2}.*Assertions/ {
+            if (!match($0, /PID [0-9]+\(/)) next
+            tail = substr($0, RSTART + 4)               # "127(powerd) Created ..."
+            paren = index(tail, ")")
+            pid  = substr(tail, 1, index(tail, "(") - 1)
+            proc = substr(tail, index(tail, "(") + 1, paren - index(tail, "(") - 1)
+            rest = substr(tail, paren + 2)              # "Created PreventUserIdleSystemSleep \"...\" 00:09:10 ..."
+            # action verb
+            if (!match(rest, /^(Created|Released|TimedOut|Summary)/)) next
+            action = substr(rest, RSTART, RLENGTH)
+            rest = substr(rest, RLENGTH + 2)
+            # assertion type
+            n = split(rest, parts, /[[:space:]]+/)
+            atype = parts[1]
+            # named: first quoted string
+            name = "-"
+            if (match($0, /"[^"]*"/)) name = substr($0, RSTART + 1, RLENGTH - 2)
+            # held duration: pattern HH:MM:SS (last one wins — there is exactly one in the asserttion body)
+            held = "-"
+            t = $0
+            while (match(t, / [0-9][0-9]:[0-9][0-9]:[0-9][0-9] /)) {
+                held = substr(t, RSTART + 1, 8)
+                t = substr(t, RSTART + RLENGTH)
+            }
+
+            # ---- normalize chatty per-channel names so dedupe can collapse them ----
+            # coreaudiod registers one assertion per audio context; treat them
+            # all as a single "audio playback" hold.
+            if (proc == "coreaudiod" && name ~ /context[0-9]+\./) name = "audio playback"
+
+            # ---- noise filters ----
+            if (action == "Summary")  next     # mid-assertion progress; not state-changes
+            # chatty types we never care about
+            if (atype == "BackgroundTask")           next
+            if (atype == "ApplePushServiceTask")     next
+            if (atype == "InteractivePushServiceTask") next
+            if (atype == "NetworkClientActive")      next
+            if (atype == "UserIsActive")             next
+            if (atype == "SystemIsActive")           next
+            if (atype == "ExternalMedia")            next
+            if (atype == "PreventUserIdleDisplaySleep") next   # too granular
+            if (atype == "InternalPreventDisplaySleep") next
+
+            # ---- classify ----
+
+            # MaintenanceWake: dark wake for system housekeeping (TM, iCloud, ...)
+            if (atype == "MaintenanceWake") {
+                if (action == "Created")
+                    printf "%s\tDARK-WAKE\tMaintenance darkwake started (by %s)\n",
+                           ts($0), proc
+                else if (action == "Released")
+                    printf "%s\tDARK-WAKE\tMaintenance darkwake ended (held %s)\n",
+                           ts($0), held
+                next
+            }
+
+            # InternalPreventSleep "Holding in darkwake ..." — powerd hourly probe
+            if (atype == "InternalPreventSleep" && name ~ /Holding in darkwake/) {
+                if (action == "Created")
+                    printf "%s\tDARK-PROBE\tDarkwake (powerd inactivity probe)\n",
+                           ts($0)
+                next                            # ignore the matching Released (instant)
+            }
+
+            # PreventSystemSleep: full sleep blocker. Skip WindowServer.DMGrace
+            # (its DM-grace assertion is a brief hardware-debounce window, not user-meaningful).
+            if (atype == "PreventSystemSleep") {
+                if (name ~ /WindowServer\.DMGrace/) next
+                v = action_verb(action)
+                if (action == "Created")
+                    printf "%s\tPREVENT\t%s %s blocking system sleep (\"%s\")\n",
+                           ts($0), proc, v, name
+                else
+                    printf "%s\tPREVENT-END\t%s %s blocking system sleep (\"%s\", held %s)\n",
+                           ts($0), proc, v, name, held
+                next
+            }
+
+            # PreventUserIdleSystemSleep: skip the chatty powerd / "display is on" pair
+            # (it duplicates the DISPLAY-ON/ DISPLAY-OFF notifications).
+            if (atype == "PreventUserIdleSystemSleep") {
+                if (proc == "powerd" && name ~ /Prevent sleep while display is on/) next
+                v = action_verb(action)
+                if (action == "Created")
+                    printf "%s\tPREVENT\t%s %s preventing idle sleep (\"%s\")\n",
+                           ts($0), proc, v, name
+                else
+                    printf "%s\tPREVENT-END\t%s %s preventing idle sleep (\"%s\", held %s)\n",
+                           ts($0), proc, v, name, held
+                next
+            }
+
+            # NoIdleSleep / NoDisplaySleep — caffeinate / explicit holds
+            if (atype == "NoIdleSleepAssertion" || atype == "NoDisplaySleepAssertion") {
+                v = action_verb(action)
+                if (action == "Created")
+                    printf "%s\tCAFFEINATE\t%s %s no-sleep hold (%s, \"%s\")\n",
+                           ts($0), proc, v, atype, name
+                else
+                    printf "%s\tCAFFEINATE\t%s %s no-sleep hold (%s, held %s)\n",
+                           ts($0), proc, v, atype, held
+                next
+            }
+
+            # DisplayWake — typically NotificationCenter lighting the screen for a banner.
+            # Skip the matching Released (uninteresting); keep Created and TimedOut.
+            if (atype == "DisplayWake") {
+                if (action == "Released") next
+                printf "%s\tNOTIF-WAKE\tDisplay lit by %s (notification, \"%s\")\n",
+                       ts($0), proc, name
+                next
+            }
+        }
+    ' "$_src"
+}
+
 action_wake_history() {
-    printf '== sleep/wake history (last %s relevant log lines) ==\n' \
-        "$WAKE_HISTORY_LINES"
-    pmset -g log 2>/dev/null \
-        | grep -iE 'sleep|wake|darkwake|assertion' \
-        | tail -n "$WAKE_HISTORY_LINES" \
-        | sed 's/^/  /'
-    printf '\n'
-    printf '== wake reasons (from unified log, last 24h, needs root for full data) ==\n'
+    _n="${WAKE_HISTORY_EVENTS:-10}"
+    _tmp=$(mktemp 2>/dev/null || printf '/tmp/mpd.wh.%s' "$$")
+    _ev="${_tmp}.events"
+    _dd="${_tmp}.dedup"
+    pmset -g log > "$_tmp" 2>/dev/null
+    log_debug "pmset -g log: $(wc -l < "$_tmp" | tr -d ' ') lines captured to $_tmp"
+
+    extract_power_events "$_tmp" > "$_ev"
+    _raw_total=$(wc -l < "$_ev" | tr -d ' ')
+
+    # Collapse adjacent identical (category, description) rows into one with
+    # an (×N) multiplier and time-range. coreaudiod is normalised in the
+    # extractor, but other bursts (e.g. ShipIt update sweeps) still benefit.
+    awk -F'\t' '
+        function emit(  span) {
+            if (prev_cat == "") return
+            if (n > 1) {
+                # If first and last timestamps differ, show range.
+                if (first_ts != last_ts)
+                    printf "%s..%s\t%s\t%s (x%d)\n",
+                           first_ts, substr(last_ts, 12), prev_cat, prev_desc, n
+                else
+                    printf "%s\t%s\t%s (x%d)\n",
+                           first_ts, prev_cat, prev_desc, n
+            } else {
+                printf "%s\t%s\t%s\n", first_ts, prev_cat, prev_desc
+            }
+        }
+        {
+            if ($2 == prev_cat && $3 == prev_desc) {
+                n++; last_ts = $1; next
+            }
+            emit()
+            first_ts = $1; last_ts = $1; prev_cat = $2; prev_desc = $3; n = 1
+        }
+        END { emit() }
+    ' "$_ev" > "$_dd"
+    _dedup_total=$(wc -l < "$_dd" | tr -d ' ')
+
+    printf '== last %s power events (oldest first; "*" marks a power-state change) ==\n' "$_n"
+    if [ ! -s "$_dd" ]; then
+        printf '  (no power events found in pmset log — log may be empty or in an unrecognised format)\n'
+        rm -f "$_tmp" "$_ev" "$_dd"
+        return 0
+    fi
+
+    # Format: " * YYYY-MM-DD HH:MM:SS  CATEGORY      description"
+    tail -n "$_n" "$_dd" | awk -F'\t' '
+        function flag(cat) {
+            if (cat == "DISPLAY-ON")  return "*"
+            if (cat == "DISPLAY-OFF") return "*"
+            if (cat == "SLEEP"     )  return "*"
+            if (cat == "WAKE"      )  return "*"
+            if (cat == "HIBERNATE" )  return "*"
+            if (cat == "DARK-WAKE" )  return "*"
+            return " "
+        }
+        { printf "  %s  %-21s  %-11s  %s\n", flag($2), $1, $2, $3 }
+    '
+
+    printf '\n  (showing last %s of %s deduped events; %s raw events; %s pmset log lines)\n' \
+        "$_n" "$_dedup_total" "$_raw_total" "$(wc -l < "$_tmp" | tr -d ' ')"
+    printf '  (re-run with "%s wake-history-raw" for the underlying pmset log lines)\n' \
+        "$PROG"
+
+    rm -f "$_tmp" "$_ev" "$_dd"
+
+    printf '\n== wake reasons (from unified log, last 24h, needs root for full data) ==\n'
     if is_root; then
         log show --last 24h --predicate \
             'eventMessage CONTAINS[c] "Wake reason"' \
@@ -511,6 +765,17 @@ action_wake_history() {
     else
         printf '  (run as root for full unified-log wake reasons)\n'
     fi
+}
+
+# Raw pmset log view — kept for when the narrative extractor is hiding
+# something the user wants to see.
+action_wake_history_raw() {
+    printf '== sleep/wake history (last %s relevant pmset log lines) ==\n' \
+        "$WAKE_HISTORY_LINES"
+    pmset -g log 2>/dev/null \
+        | grep -iE 'sleep|wake|darkwake|assertion|hibernat|battery' \
+        | tail -n "$WAKE_HISTORY_LINES" \
+        | sed 's/^/  /'
 }
 
 action_scheduled() {
@@ -938,7 +1203,8 @@ debug=$DEBUG dry-run=$DRY_RUN force=$FORCE"
         status)        action_status ;;
         assertions)    action_assertions ;;
         culprits)      action_culprits ;;
-        wake-history)  action_wake_history ;;
+        wake-history)     action_wake_history ;;
+        wake-history-raw) action_wake_history_raw ;;
         scheduled)     action_scheduled ;;
         kill)          action_kill ;;
         prevent)       action_prevent ;;
