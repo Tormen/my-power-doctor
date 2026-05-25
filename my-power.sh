@@ -36,7 +36,7 @@
 set -u
 
 PROG="my-power-doctor"
-VERSION="1.2.2"
+VERSION="1.3.0"
 
 # ----------------------------------------------------------------------------
 # DEFAULTS (overridable by config file)
@@ -618,8 +618,8 @@ action_summary() {
     fi
     printf '\n'
 
-    # ---- Sleep / wake / hibernate events (root only, grouped) ----
-    printf '  Sleep / wake / hibernate (unified log, last 24h):\n'
+    # ---- Power events from unified log (root only, grouped) ----
+    printf '  Power events (unified log, last 24h):\n'
     if is_root; then
         _wr_tmp="${_tmp}.wr"
         log show --last 24h --predicate \
@@ -627,7 +627,10 @@ action_summary() {
               OR eventMessage CONTAINS[c] "Sleep transition"
               OR eventMessage CONTAINS[c] "Entering Sleep"
               OR eventMessage CONTAINS[c] "Going to sleep"
-              OR eventMessage CONTAINS[c] "Hibernate"' \
+              OR eventMessage CONTAINS[c] "Hibernate"
+              OR eventMessage CONTAINS[c] "PerfMode:"
+              OR eventMessage CONTAINS[c] "ClamshellState"
+              OR eventMessage CONTAINS[c] "Settings change for power source"' \
             --style compact 2>/dev/null > "$_wr_tmp" || true
         # Drop our own "log show" self-mention if present (the predicate
         # itself contains the keywords, so the log line that records the
@@ -666,21 +669,34 @@ action_summary() {
                     m = ts_to_minute($0); if (m == "") next
                     low = tolower($0)
 
+                    # WiFi housekeeping (subset of "Wake reason" output).
                     if (low ~ /systemwokenbywifi/) { print "WIFI\t" m; next }
 
+                    # Lid open / close (powerd:displayState ClamshellState).
+                    if (low ~ /clamshellstate.*closed[[:space:]]*:[[:space:]]*1/) { print "LID-CLOSE\t" m; next }
+                    if (low ~ /clamshellstate.*closed[[:space:]]*:[[:space:]]*0/) { print "LID-OPEN\t"  m; next }
+
+                    # Power source changes (powerd:pmSettings).
+                    if (low ~ /settings change for power source change to ac power/)      { print "AC\t"   m; next }
+                    if (low ~ /settings change for power source change to battery power/) { print "BATT\t" m; next }
+
+                    # PerfMode-based sleep/wake.  Authoritative for builds
+                    # that do not emit explicit "Wake reason" / "Going to
+                    # sleep" lines (macOS 25.x).  Restricted = asleep.
+                    if (low ~ /current perfmode: unrestricted, target perfmode: restricted/) { print "SLEEP\t" m; next }
+                    if (low ~ /current perfmode: restricted, target perfmode: unrestricted/) { print "WAKE\t"  m; next }
+
+                    # Text-based sleep / wake (older or non-powerd sources).
                     if (low ~ /entering sleep|going to sleep|sleep transition.*to[[:space:]]+sleep|pmrd: system sleep/) {
                         print "SLEEP\t" m; next
                     }
-
                     if (low ~ /wake reason|wake from|pmrd: system wake/) {
                         print "WAKE\t" m; next
                     }
 
+                    # Hibernate transitions (NOT config-string noise).
                     if (low ~ /hibernate/) {
-                        # Exclude config-string noise that just mentions
-                        # the word "Hibernate" without being a transition.
                         if ($0 ~ /Setting Hibernate mode|"Hibernate File"|"Hibernate Mode"|HibernateMode/) next
-                        # Real transition phrases only.
                         if (low ~ /going to hibernate|hibernating|hibernate image|hibernate restore|hibernate complete|sleepimage/) {
                             print "HIB\t" m; next
                         }
@@ -688,15 +704,23 @@ action_summary() {
                 }
             ' "$_wr_tmp" | sort -u)
 
-            _sleep_times=$(printf '%s\n' "$_class" | awk -F'\t' '$1=="SLEEP"{print $2}')
-            _wake_times=$( printf '%s\n' "$_class" | awk -F'\t' '$1=="WAKE" {print $2}')
-            _wifi_times=$( printf '%s\n' "$_class" | awk -F'\t' '$1=="WIFI" {print $2}')
-            _hib_times=$(  printf '%s\n' "$_class" | awk -F'\t' '$1=="HIB"  {print $2}')
+            _sleep_times=$(    printf '%s\n' "$_class" | awk -F'\t' '$1=="SLEEP"     {print $2}')
+            _wake_times=$(     printf '%s\n' "$_class" | awk -F'\t' '$1=="WAKE"      {print $2}')
+            _wifi_times=$(     printf '%s\n' "$_class" | awk -F'\t' '$1=="WIFI"      {print $2}')
+            _hib_times=$(      printf '%s\n' "$_class" | awk -F'\t' '$1=="HIB"       {print $2}')
+            _lid_close_times=$(printf '%s\n' "$_class" | awk -F'\t' '$1=="LID-CLOSE" {print $2}')
+            _lid_open_times=$( printf '%s\n' "$_class" | awk -F'\t' '$1=="LID-OPEN"  {print $2}')
+            _ac_times=$(       printf '%s\n' "$_class" | awk -F'\t' '$1=="AC"        {print $2}')
+            _batt_times=$(     printf '%s\n' "$_class" | awk -F'\t' '$1=="BATT"      {print $2}')
 
-            _sleep_n=$(printf '%s' "$_sleep_times" | awk 'NF{c++} END{print c+0}')
-            _wake_n=$( printf '%s' "$_wake_times"  | awk 'NF{c++} END{print c+0}')
-            _wifi_n=$( printf '%s' "$_wifi_times"  | awk 'NF{c++} END{print c+0}')
-            _hib_n=$(  printf '%s' "$_hib_times"   | awk 'NF{c++} END{print c+0}')
+            _sleep_n=$(    printf '%s' "$_sleep_times"     | awk 'NF{c++} END{print c+0}')
+            _wake_n=$(     printf '%s' "$_wake_times"      | awk 'NF{c++} END{print c+0}')
+            _wifi_n=$(     printf '%s' "$_wifi_times"      | awk 'NF{c++} END{print c+0}')
+            _hib_n=$(      printf '%s' "$_hib_times"       | awk 'NF{c++} END{print c+0}')
+            _lid_close_n=$(printf '%s' "$_lid_close_times" | awk 'NF{c++} END{print c+0}')
+            _lid_open_n=$( printf '%s' "$_lid_open_times"  | awk 'NF{c++} END{print c+0}')
+            _ac_n=$(       printf '%s' "$_ac_times"        | awk 'NF{c++} END{print c+0}')
+            _batt_n=$(     printf '%s' "$_batt_times"      | awk 'NF{c++} END{print c+0}')
 
             # Format a time list down to "HH:MM HH:MM ..." for compactness.
             _fmt_times() {
@@ -705,11 +729,11 @@ action_summary() {
             }
 
             if [ "$_sleep_n" -gt 0 ]; then
-                printf '    - %s sleep entry/entries: %s\n' \
+                printf '    - %s sleep transition(s): %s\n' \
                     "$_sleep_n" "$(_fmt_times "$_sleep_times")"
             fi
             if [ "$_wake_n" -gt 0 ]; then
-                printf '    - %s real wake event(s): %s\n' \
+                printf '    - %s wake transition(s): %s\n' \
                     "$_wake_n" "$(_fmt_times "$_wake_times")"
             fi
             if [ "$_wifi_n" -gt 0 ]; then
@@ -721,8 +745,32 @@ action_summary() {
                 printf '    - %s hibernate event(s): %s\n' \
                     "$_hib_n" "$(_fmt_times "$_hib_times")"
             fi
+            if [ "$_lid_close_n" -gt 0 ] || [ "$_lid_open_n" -gt 0 ]; then
+                printf '    - lid: %s close(s)' "$_lid_close_n"
+                if [ "$_lid_close_n" -gt 0 ]; then
+                    printf ' at %s' "$(_fmt_times "$_lid_close_times")"
+                fi
+                printf ', %s open(s)' "$_lid_open_n"
+                if [ "$_lid_open_n" -gt 0 ]; then
+                    printf ' at %s' "$(_fmt_times "$_lid_open_times")"
+                fi
+                printf '\n'
+            fi
+            if [ "$_ac_n" -gt 0 ] || [ "$_batt_n" -gt 0 ]; then
+                printf '    - power source: %s -> AC' "$_ac_n"
+                if [ "$_ac_n" -gt 0 ]; then
+                    printf ' at %s' "$(_fmt_times "$_ac_times")"
+                fi
+                printf ', %s -> battery' "$_batt_n"
+                if [ "$_batt_n" -gt 0 ]; then
+                    printf ' at %s' "$(_fmt_times "$_batt_times")"
+                fi
+                printf '\n'
+            fi
             if [ "$_sleep_n" -eq 0 ] && [ "$_wake_n" -eq 0 ] \
-                    && [ "$_wifi_n" -eq 0 ] && [ "$_hib_n" -eq 0 ]; then
+                    && [ "$_wifi_n" -eq 0 ] && [ "$_hib_n" -eq 0 ] \
+                    && [ "$_lid_close_n" -eq 0 ] && [ "$_lid_open_n" -eq 0 ] \
+                    && [ "$_ac_n" -eq 0 ] && [ "$_batt_n" -eq 0 ]; then
                 printf '    - %s line(s), none classifiable (use -D for raw)\n' \
                     "$(awk 'END{print NR}' "$_wr_tmp")"
             fi
