@@ -36,7 +36,7 @@
 set -u
 
 PROG="my-power-doctor"
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 # ----------------------------------------------------------------------------
 # DEFAULTS (overridable by config file)
@@ -784,7 +784,14 @@ action_summary() {
                     if (state == "" || t1 == "") return
                     print t1 "\t" t2 "\t" state "\t" ann
                 }
-                BEGIN { state = ""; phase_start = ""; ann = "" }
+                function reset_phase(newstate, ts) {
+                    state = newstate; phase_start = ts; ann = ""
+                    # Clear the per-phase dedup map.  awk has no `delete arr`
+                    # in strict POSIX but `for (k in seen) delete seen[k]`
+                    # works on both gawk and BSD awk.
+                    for (k in seen) delete seen[k]
+                }
+                BEGIN { state = ""; phase_start = ""; ann = ""; split("", seen) }
                 {
                     ts = $1; cat = $2
                     if (cat == "SLEEP" || cat == "WAKE" || cat == "HIB") {
@@ -792,18 +799,23 @@ action_summary() {
                                    (cat == "WAKE")  ? "AWAKE" : "HIBERNATE"
                         if (newstate != state) {
                             emit(state, phase_start, ts, ann)
-                            state = newstate; phase_start = ts; ann = ""
+                            reset_phase(newstate, ts)
                         }
                         next
                     }
-                    # Annotation events — attach to current phase.
+                    # Annotation events — attach to current phase, deduped
+                    # at minute precision (powerd:displayState logs each
+                    # lid event twice within the same minute).
                     label = cat
                     if (cat == "WIFI")      label = "WoW"
                     if (cat == "LID-CLOSE") label = "lid-CLOSE"
                     if (cat == "LID-OPEN")  label = "lid-OPEN"
                     if (cat == "BATT")      label = "->battery"
                     if (cat == "AC")        label = "->AC"
-                    ann = ann " " label "@" substr(ts, 12, 5)
+                    tag = label "@" substr(ts, 12, 5)
+                    if (tag in seen) next
+                    seen[tag] = 1
+                    ann = ann " " tag
                 }
                 END { emit(state, phase_start, "now", ann) }
             ')
