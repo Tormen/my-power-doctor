@@ -36,7 +36,7 @@
 set -u
 
 PROG="my-power-doctor"
-VERSION="1.5.1"
+VERSION="1.5.2"
 
 # ----------------------------------------------------------------------------
 # DEFAULTS (overridable by config file)
@@ -532,11 +532,27 @@ _print_knob_table() {
         printf '  %-6s %-20s %-5s %s\n' '------' '--------------------' '-----' \
             '------------------------------------------------'
     fi
-    knob_table | while IFS='	' read -r _s _f _d; do
+    _saw_unknown=0
+    _ut=$(mktemp 2>/dev/null || printf '/tmp/mpd.knobs.%s' "$$")
+    knob_table > "$_ut"
+    while IFS='	' read -r _s _f _d; do
         [ -n "$_s" ] || continue
         _v=$(_resolve_knob_value "$_pg" "$_f")
-        printf '  %-6s %-20s %-5s %s\n' "$_s" "$_f" "${_v:-?}" "$_d"
-    done
+        if [ -z "$_v" ]; then
+            _saw_unknown=1
+            printf '  %-6s %-20s %-5s %s\n' "$_s" "$_f" '?' "$_d"
+        else
+            printf '  %-6s %-20s %-5s %s\n' "$_s" "$_f" "$_v" "$_d"
+        fi
+    done < "$_ut"
+    rm -f "$_ut"
+    if [ "$_mode" = "full" ] && [ "$_saw_unknown" -eq 1 ]; then
+        printf '\n  ?  = not surfaced by pmset or the persisted plist on this\n'
+        printf '       build.  On Apple Silicon, a few knobs (proximitywake,\n'
+        printf '       lidwake, acwake) are "set-only" -- pmset accepts the\n'
+        printf '       command but the value is not readable here.  The setting\n'
+        printf '       may still take effect; you just cannot verify via my-power.\n'
+    fi
 }
 
 action_get() {
@@ -622,7 +638,15 @@ action_set() {
     _new=$(_resolve_knob_value \
         "$( { pmset -g 2>/dev/null; pmset -g custom 2>/dev/null; } )" \
         "$_full")
-    printf '       OK; %s is now: %s\n' "$_full" "${_new:-?}"
+    if [ -n "$_new" ]; then
+        printf '       OK; %s is now: %s\n' "$_full" "$_new"
+    else
+        printf '       OK; pmset accepted the command.  The current value of\n'
+        printf '       %s is not surfaced by pmset or the persisted plist on\n' "$_full"
+        printf '       this build (likely Apple Silicon -- proximitywake / lidwake\n'
+        printf '       / acwake fall in this bucket); the setting may still take\n'
+        printf '       effect, but my-power cannot verify it for you.\n'
+    fi
 }
 
 # ----------------------------------------------------------------------------
