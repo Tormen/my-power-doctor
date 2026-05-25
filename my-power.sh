@@ -36,7 +36,7 @@
 set -u
 
 PROG="my-power-doctor"
-VERSION="1.5.0"
+VERSION="1.5.1"
 
 # ----------------------------------------------------------------------------
 # DEFAULTS (overridable by config file)
@@ -468,6 +468,52 @@ knob_lookup() {
     knob_table | awk -F'\t' -v s="$1" '$1==s {print $2 "\t" $3; exit}'
 }
 
+# Map pmset CLI name -> persisted plist key name.  Most are identical;
+# the few that differ are hardcoded.  Used as a fallback source when
+# `pmset -g` / `pmset -g custom` don't surface the knob (Apple Silicon
+# hides several historically-Intel knobs from the active-settings view
+# even though pmset itself still accepts the set).
+_pmset_to_plist_key() {
+    case "$1" in
+        darkwakes)     printf 'DarkWakeBackgroundTasks' ;;
+        disksleep)     printf 'Disk Sleep Timer' ;;
+        displaysleep)  printf 'Display Sleep Timer' ;;
+        sleep)         printf 'System Sleep Timer' ;;
+        womp)          printf 'Wake On LAN' ;;
+        lidwake)       printf 'LidWake' ;;
+        acwake)        printf 'Wake on AC Change' ;;
+        proximitywake) printf 'ProximityWake' ;;
+        *)             printf '%s' "$1" ;;
+    esac
+}
+
+# Resolve a pmset knob's current value.  Sources tried in order:
+#   1. `pmset -g` + `pmset -g custom` (passed in as $1, captured by caller
+#      so we don't fork pmset N times for a full-table print).
+#   2. /Library/Preferences/com.apple.PowerManagement.plist (the persisted
+#      store; covers knobs pmset accepts but doesn't echo).
+# Echos the value, or empty on total miss.  Boolean true/false get
+# normalised to 1/0 so the table column is uniform.
+_resolve_knob_value() {
+    _pg_blob="$1"; _full="$2"
+    _v=$(printf '%s\n' "$_pg_blob" | awk -v k="$_full" '$1==k {print $2; exit}')
+    if [ -n "$_v" ]; then printf '%s' "$_v"; return; fi
+    _plist=/Library/Preferences/com.apple.PowerManagement.plist
+    [ -r "$_plist" ] || return
+    _pkey=$(_pmset_to_plist_key "$_full")
+    for _src in 'AC Power' 'Battery Power' 'SystemPowerSettings'; do
+        _v=$(plutil -extract "$_src.$_pkey" raw "$_plist" 2>/dev/null)
+        if [ -n "$_v" ]; then
+            case "$_v" in
+                true)  printf '1'  ;;
+                false) printf '0'  ;;
+                *)     printf '%s' "$_v" ;;
+            esac
+            return
+        fi
+    done
+}
+
 # Echo SHORT for FULL_NAME, empty on miss (used by status to label rows).
 knob_short_for_full() {
     knob_table | awk -F'\t' -v f="$1" '$2==f {print $1; exit}'
@@ -488,11 +534,7 @@ _print_knob_table() {
     fi
     knob_table | while IFS='	' read -r _s _f _d; do
         [ -n "$_s" ] || continue
-        _v=$(printf '%s\n' "$_pg" | awk -v k="$_f" '
-            # pmset -g rows look like "   tcpkeepalive         1".  Match
-            # exact first field; emit the second whitespace-separated token.
-            $1==k { print $2; exit }
-        ')
+        _v=$(_resolve_knob_value "$_pg" "$_f")
         printf '  %-6s %-20s %-5s %s\n' "$_s" "$_f" "${_v:-?}" "$_d"
     done
 }
@@ -509,8 +551,9 @@ action_get() {
         fi
         _full=$(printf '%s' "$_info" | cut -f1)
         _desc=$(printf '%s' "$_info" | cut -f2)
-        _v=$( { pmset -g 2>/dev/null; pmset -g custom 2>/dev/null; } \
-            | awk -v k="$_full" '$1==k {print $2; exit}')
+        _v=$(_resolve_knob_value \
+            "$( { pmset -g 2>/dev/null; pmset -g custom 2>/dev/null; } )" \
+            "$_full")
         printf '== power knob: %s ==\n' "$SELECTOR"
         printf '  short:      %s\n' "$SELECTOR"
         printf '  pmset name: %s\n' "$_full"
@@ -552,8 +595,9 @@ action_set() {
         ''|*[!0-9]*) die "set: value must be a non-negative integer (got '$SET_VAL')" ;;
     esac
 
-    _old=$( { pmset -g 2>/dev/null; pmset -g custom 2>/dev/null; } \
-        | awk -v k="$_full" '$1==k {print $2; exit}')
+    _old=$(_resolve_knob_value \
+        "$( { pmset -g 2>/dev/null; pmset -g custom 2>/dev/null; } )" \
+        "$_full")
     _scope="${SET_SCOPE:--a}"
     _scope_desc="all sources"
     case "$_scope" in
@@ -575,8 +619,9 @@ action_set() {
     pmset "$_scope" "$_full" "$SET_VAL" \
         || die "pmset $_scope $_full $SET_VAL failed (exit $?)"
 
-    _new=$( { pmset -g 2>/dev/null; pmset -g custom 2>/dev/null; } \
-        | awk -v k="$_full" '$1==k {print $2; exit}')
+    _new=$(_resolve_knob_value \
+        "$( { pmset -g 2>/dev/null; pmset -g custom 2>/dev/null; } )" \
+        "$_full")
     printf '       OK; %s is now: %s\n' "$_full" "${_new:-?}"
 }
 
