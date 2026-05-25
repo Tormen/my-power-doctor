@@ -42,10 +42,12 @@ anything weird?":
     21:03  prevent      ShipIt started blocking system sleep ("Updating") (x2)
     ...
 
-  Wake reasons (unified log, last 24h):
-    - 7 distinct Wake-on-WiFi darkwake(s): 19:25 19:40 20:06 20:22 20:24 20:48 21:03
+  Sleep / wake / hibernate (unified log, last 24h):
+    - 3 sleep entry/entries: 22:14 02:30 06:15
+    - 2 real wake event(s): 07:42 09:36
+    - 7 Wake-on-WiFi darkwake(s): 19:25 19:40 20:06 20:22 20:24 20:48 21:03
       (airportd "Wake Reason not found" -- housekeeping; no user wake)
-    - 0 other wake-reason line(s)
+    - 0 hibernate event(s)
 ```
 
 The summary classifies active blockers into **real** vs **benign**:
@@ -56,9 +58,18 @@ The summary classifies active blockers into **real** vs **benign**:
 - **Real**: anything else — i.e. an app the user might actually want
   to inspect or stop.
 
-Wake-reason lines are grouped: `systemWokenByWiFi` lines (often
-duplicated by airportd) are deduped to distinct minute-precision wake
-times, and counted separately from "other" wake-reason lines.
+Unified-log events are classified into four buckets:
+
+- **Sleep entries** — matches `Entering Sleep`, `Going to sleep`,
+  `Sleep transition...to Sleep`, `PMRD: System Sleep`.
+- **Real wake events** — matches `Wake reason` or `Wake from`, excluding
+  the WiFi-housekeeping subset.
+- **Wake-on-WiFi darkwakes** — `systemWokenByWiFi` (airportd); often
+  emitted as 2-3 lines per actual wake, deduped to distinct minutes.
+- **Hibernate events** — anything matching `Hibernate`.
+
+Each bucket reports a count and a compact `HH:MM` time list, so a noisy
+24h of housekeeping collapses to one screen.
 
 **`-D` shows the full raw blocks BEFORE the summary** — that's the
 old-style culprits table, the state-file listing, the 10-event narrative

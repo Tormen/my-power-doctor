@@ -36,7 +36,7 @@
 set -u
 
 PROG="my-power-doctor"
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 # ----------------------------------------------------------------------------
 # DEFAULTS (overridable by config file)
@@ -618,49 +618,80 @@ action_summary() {
     fi
     printf '\n'
 
-    # ---- Wake reasons (root only, grouped) ----
-    printf '  Wake reasons (unified log, last 24h):\n'
+    # ---- Sleep / wake / hibernate events (root only, grouped) ----
+    printf '  Sleep / wake / hibernate (unified log, last 24h):\n'
     if is_root; then
         _wr_tmp="${_tmp}.wr"
         log show --last 24h --predicate \
-            'eventMessage CONTAINS[c] "Wake reason"' \
+            'eventMessage CONTAINS[c] "Wake reason"
+              OR eventMessage CONTAINS[c] "Sleep transition"
+              OR eventMessage CONTAINS[c] "Entering Sleep"
+              OR eventMessage CONTAINS[c] "Going to sleep"
+              OR eventMessage CONTAINS[c] "Hibernate"' \
             --style compact 2>/dev/null > "$_wr_tmp" || true
-        if [ ! -s "$_wr_tmp" ]; then
-            printf '    - (no wake-reason events in last 24h)\n'
-        else
-            _wr_total=$(awk 'END{print NR}' "$_wr_tmp")
-            # WiFi (WoW) — group by minute, dedupe (airportd often emits 2-3 lines per wake)
-            _wifi_times=$(awk '/systemWokenByWiFi/ {
-                # timestamp at start: 2026-05-24 21:03:29.624
-                t = $1 " " $2
-                sub(/\..*/, "", t)              # strip .micros
-                sub(/:[0-9][0-9]$/, "", t)      # strip :SS -> minute precision
-                print t
-            }' "$_wr_tmp" | sort -u)
-            _wifi_n=$(printf '%s' "$_wifi_times" | awk 'NF{c++} END{print c+0}')
-            _other_n=$(grep -cv "systemWokenByWiFi" "$_wr_tmp")
-            # ignore our own "log show" self-mention if present
-            _self_n=$(grep -c "log run noninteractively" "$_wr_tmp" 2>/dev/null || printf 0)
-            _other_n=$((_other_n - _self_n))
-            [ "$_other_n" -lt 0 ] && _other_n=0
+        # Drop our own "log show" self-mention if present (the predicate
+        # itself contains the keywords, so the log line that records the
+        # invocation matches).
+        if [ -s "$_wr_tmp" ]; then
+            _tmp2="${_wr_tmp}.f"
+            grep -v "log run noninteractively" "$_wr_tmp" > "$_tmp2" || true
+            mv "$_tmp2" "$_wr_tmp"
+        fi
 
+        if [ ! -s "$_wr_tmp" ]; then
+            printf '    - (no sleep/wake/hibernate events in last 24h)\n'
+        else
+            # Distinct-minute time-lists per category.
+            _sleep_times=$(awk '/Entering Sleep|Going to sleep|Sleep transition.*to[[:space:]]+Sleep|PMRD: System Sleep/ {
+                t = $1 " " $2; sub(/\..*/, "", t); sub(/:[0-9][0-9]$/, "", t); print t
+            }' "$_wr_tmp" | sort -u)
+            _wake_times=$(awk '!/systemWokenByWiFi/ && (/Wake reason/ || /Wake from/ || /PMRD: System Wake/) {
+                t = $1 " " $2; sub(/\..*/, "", t); sub(/:[0-9][0-9]$/, "", t); print t
+            }' "$_wr_tmp" | sort -u)
+            _wifi_times=$(awk '/systemWokenByWiFi/ {
+                t = $1 " " $2; sub(/\..*/, "", t); sub(/:[0-9][0-9]$/, "", t); print t
+            }' "$_wr_tmp" | sort -u)
+            _hib_times=$(awk '/Hibernate/ {
+                t = $1 " " $2; sub(/\..*/, "", t); sub(/:[0-9][0-9]$/, "", t); print t
+            }' "$_wr_tmp" | sort -u)
+
+            _sleep_n=$(printf '%s' "$_sleep_times" | awk 'NF{c++} END{print c+0}')
+            _wake_n=$( printf '%s' "$_wake_times"  | awk 'NF{c++} END{print c+0}')
+            _wifi_n=$( printf '%s' "$_wifi_times"  | awk 'NF{c++} END{print c+0}')
+            _hib_n=$(  printf '%s' "$_hib_times"   | awk 'NF{c++} END{print c+0}')
+
+            # Format a time list down to "HH:MM HH:MM ..." for compactness.
+            _fmt_times() {
+                printf '%s\n' "$1" | awk '{print substr($2,1,5)}' \
+                    | tr '\n' ' ' | sed 's/ $//'
+            }
+
+            if [ "$_sleep_n" -gt 0 ]; then
+                printf '    - %s sleep entry/entries: %s\n' \
+                    "$_sleep_n" "$(_fmt_times "$_sleep_times")"
+            fi
+            if [ "$_wake_n" -gt 0 ]; then
+                printf '    - %s real wake event(s): %s\n' \
+                    "$_wake_n" "$(_fmt_times "$_wake_times")"
+            fi
             if [ "$_wifi_n" -gt 0 ]; then
-                _times_short=$(printf '%s\n' "$_wifi_times" \
-                    | awk '{print substr($2,1,5)}' | tr '\n' ' ' | sed 's/ $//')
-                printf '    - %s distinct Wake-on-WiFi darkwake(s): %s\n' \
-                    "$_wifi_n" "$_times_short"
+                printf '    - %s Wake-on-WiFi darkwake(s): %s\n' \
+                    "$_wifi_n" "$(_fmt_times "$_wifi_times")"
                 printf '      (airportd "Wake Reason not found" -- housekeeping; no user wake)\n'
             fi
-            if [ "$_other_n" -gt 0 ]; then
-                printf '    - %s other wake-reason line(s) (use -D for raw)\n' "$_other_n"
+            if [ "$_hib_n" -gt 0 ]; then
+                printf '    - %s hibernate event(s): %s\n' \
+                    "$_hib_n" "$(_fmt_times "$_hib_times")"
             fi
-            if [ "$_wifi_n" -eq 0 ] && [ "$_other_n" -eq 0 ]; then
-                printf '    - %s line(s), none classifiable\n' "$_wr_total"
+            if [ "$_sleep_n" -eq 0 ] && [ "$_wake_n" -eq 0 ] \
+                    && [ "$_wifi_n" -eq 0 ] && [ "$_hib_n" -eq 0 ]; then
+                printf '    - %s line(s), none classifiable (use -D for raw)\n' \
+                    "$(awk 'END{print NR}' "$_wr_tmp")"
             fi
         fi
         rm -f "$_wr_tmp"
     else
-        printf '    - (run as root for unified-log wake reasons)\n'
+        printf '    - (run as root for unified-log sleep/wake/hibernate events)\n'
     fi
 
     rm -f "$_tmp" "$_ev" "$_dd"
@@ -968,15 +999,20 @@ action_wake_history() {
 
     rm -f "$_tmp" "$_ev" "$_dd"
 
-    printf '\n== wake reasons (from unified log, last 24h, needs root for full data) ==\n'
+    printf '\n== sleep/wake/hibernate (from unified log, last 24h, needs root for full data) ==\n'
     if is_root; then
         log show --last 24h --predicate \
-            'eventMessage CONTAINS[c] "Wake reason"' \
+            'eventMessage CONTAINS[c] "Wake reason"
+              OR eventMessage CONTAINS[c] "Sleep transition"
+              OR eventMessage CONTAINS[c] "Entering Sleep"
+              OR eventMessage CONTAINS[c] "Going to sleep"
+              OR eventMessage CONTAINS[c] "Hibernate"' \
             --style compact 2>/dev/null \
+            | grep -v "log run noninteractively" \
             | tail -n 30 \
             | sed 's/^/  /'
     else
-        printf '  (run as root for full unified-log wake reasons)\n'
+        printf '  (run as root for full unified-log sleep/wake/hibernate events)\n'
     fi
 }
 
