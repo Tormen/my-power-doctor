@@ -12,8 +12,8 @@ Klaus' `my-*` toolchain conventions (config search path, `--config`,
 
 | Action             | Source                              | Purpose                                          |
 | ------------------ | ----------------------------------- | ------------------------------------------------ |
-| *(no action)*      | parsed assertions + state + log     | **Default lean view**: culprits + prevented + last 10 power events |
-| `status`           | + `pmset -g`, `-g sched`            | Verbose superset of the default                  |
+| *(no action)*      | parsed assertions + state + log     | **Default**: synthesised one-screen summary. Add `-D` to see the full raw blocks (culprits table + state + 10-event timeline + raw wake-reason lines) BEFORE the summary. |
+| `status`           | + `pmset -g`, `-g sched`            | Verbose superset: host info + pmset settings + scheduled wakes + raw blocks + summary (regardless of `-D`). |
 | `assertions`       | `pmset -g assertions`               | Raw dump                                         |
 | `culprits`         | parsed `pmset -g assertions`        | Compact table: PID / proc / assertion / label    |
 | `wake-history`     | `pmset -g log`, `log show`          | **Narrative timeline** of the last N (default 10) power events |
@@ -23,6 +23,46 @@ Klaus' `my-*` toolchain conventions (config search path, `--config`,
 | `prevent <SEL>`    | `launchctl disable` + `bootout`     | **Persistent** — survives reboot                 |
 | `restore <SEL>`    | `launchctl enable` + `kickstart`    | Undo `prevent`                                   |
 | `state`            | state file                          | What we've disabled (and when)                   |
+
+### Default output — synthesised summary
+
+Bare `my-power-doctor` prints a single ~20-line synthesis answering "is
+anything weird?":
+
+```
+== summary ==
+  Right now:
+    - 1 active sleep blocker(s), all benign
+        powerd (pid 127) PreventUserIdleSystemSleep, held 00:09:25 (benign -- "display is on")
+    - 0 services prevented
+
+  Recent activity (last 10 events, 2026-05-24 21:03 -> 2026-05-24 21:09):
+    21:03  prevent      Signal started blocking system sleep ("Preparing to relaunch")
+    21:03  prev. end    Signal ended blocking system sleep ("Preparing to relaunch", held 00:00:00)
+    21:03  prevent      ShipIt started blocking system sleep ("Updating") (x2)
+    ...
+
+  Wake reasons (unified log, last 24h):
+    - 7 distinct Wake-on-WiFi darkwake(s): 19:25 19:40 20:06 20:22 20:24 20:48 21:03
+      (airportd "Wake Reason not found" -- housekeeping; no user wake)
+    - 0 other wake-reason line(s)
+```
+
+The summary classifies active blockers into **real** vs **benign**:
+
+- **Benign**: powerd's `"Powerd - Prevent sleep while display is on"`
+  assertion (which just means the display is on; not a runaway), and
+  any blocker that matches the configured whitelist.
+- **Real**: anything else — i.e. an app the user might actually want
+  to inspect or stop.
+
+Wake-reason lines are grouped: `systemWokenByWiFi` lines (often
+duplicated by airportd) are deduped to distinct minute-precision wake
+times, and counted separately from "other" wake-reason lines.
+
+**`-D` shows the full raw blocks BEFORE the summary** — that's the
+old-style culprits table, the state-file listing, the 10-event narrative
+timeline, and the raw unified-log wake-reason lines.
 
 ### `wake-history` — narrative timeline
 
@@ -96,12 +136,13 @@ overridden] …`) so a `--force` in your shell history is never invisible.
 sudo install -m 0755 my-power-doctor /usr/local/bin/
 
 # first look — no changes
-my-power-doctor                       # default: culprits + state + last 10 power events
-my-power-doctor status                # verbose superset (+ pmset settings, scheduled wakes)
+my-power-doctor                       # default: synthesised one-screen summary
+my-power-doctor -D                    # raw blocks + summary (verbose default)
+my-power-doctor status                # verbose superset (+ pmset settings, scheduled wakes, raw, summary)
 my-power-doctor culprits              # just the culprit table
 my-power-doctor wake-history          # narrative timeline of last 10 power events
 my-power-doctor wake-history-raw      # raw pmset log lines (escape hatch)
-sudo my-power-doctor wake-history     # +full unified-log wake reasons (root only)
+sudo my-power-doctor                  # +real wake-reason summary (root only)
 
 # write the default config to your /LINKS/default
 my-power-doctor --create-config /LINKS/default/my-power-doctor.conf
@@ -135,7 +176,9 @@ sudo my-power-doctor prevent all
 - `--config PATH` — override; prints which file is used.
 - `--create-config [PATH]` — write default config to PATH or stdout.
   Never overwrites an existing file.
-- `-D | --debug` — append trace to `$DEBUG_LOG`.
+- `-D | --debug` — verbose mode: show the full raw blocks (culprits, state,
+  10-event timeline, raw wake-reason lines) BEFORE the synthesised summary.
+  Also appends a debug trace to `$DEBUG_LOG`.
 - `-n | --dry-run` — print intended actions only.
 - `-f | --force` — act on whitelisted rows too. Required to touch any
   row marked `W` in the culprits table. The override is loudly logged.

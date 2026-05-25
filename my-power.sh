@@ -36,7 +36,7 @@
 set -u
 
 PROG="my-power-doctor"
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # ----------------------------------------------------------------------------
 # DEFAULTS (overridable by config file)
@@ -143,12 +143,14 @@ USAGE:
     $PROG [GLOBAL OPTS] <action> [args...]
 
 ACTIONS:
-    (no action)             Default lean view: active sleep blockers +
-                            prevented services + the last N power events
-                            (default N=10, see WAKE_HISTORY_EVENTS).
-    status                  Verbose superset of the default: also includes
-                            host info, 'pmset -g' sleep settings, and
-                            scheduled wakes ('pmset -g sched').
+    (no action)             Default: ONLY the synthesised one-screen summary
+                            (current blockers + recent events + wake-reason
+                            patterns). Add -D to see the full raw blocks
+                            (culprits table + state file + 10-event timeline
+                            + raw wake-reason lines) BEFORE the summary.
+    status                  Verbose superset: host info + 'pmset -g' settings
+                            + scheduled wakes, then the raw blocks AND the
+                            summary (independent of -D).
     assertions              Full parsed dump of pmset -g assertions.
     culprits                Compact list of PID/name/label/assertion.
     wake-history            Narrative timeline of the last N (default 10)
@@ -184,7 +186,10 @@ GLOBAL OPTS:
     --config <PATH>         Use this config file (and print which one).
     --create-config [PATH]  Write default config to PATH or stdout. Never
                             auto-writes existing files.
-    -D | --debug            Append debug trace to \$DEBUG_LOG.
+    -D | --debug            Verbose mode: show full raw blocks (culprits,
+                            state, 10-event timeline, raw wake-reason lines)
+                            BEFORE the synthesised summary. Also appends a
+                            debug trace to \$DEBUG_LOG.
     -n | --dry-run          Print intended actions, do nothing.
     -f | --force            Act on whitelisted rows too (the whitelist normally
                             protects ALL selectors, including #N and by-name).
@@ -286,6 +291,20 @@ load_config() {
 # WHITELIST matching
 # ----------------------------------------------------------------------------
 # Returns 0 if any of (pid, name, label, type) matches a whitelist token.
+# True for assertions that are technically "blockers" but functionally
+# benign: the same ones we filter from the event timeline as noise.
+# Currently: powerd's "Powerd - Prevent sleep while display is on" — this
+# just means the display is on, it is NOT a runaway app.
+_is_benign_blocker() {
+    _bb_name="$1"; _bb_type="$2"; _bb_aname="$3"
+    if [ "$_bb_name" = "powerd" ] && [ "$_bb_type" = "PreventUserIdleSystemSleep" ]; then
+        case "$_bb_aname" in
+            *"Prevent sleep while display is on"*) return 0 ;;
+        esac
+    fi
+    return 1
+}
+
 is_whitelisted() {
     _pid="$1"; _name="$2"; _label="$3"; _type="$4"
     [ -n "$WHITELIST" ] || return 1
@@ -411,11 +430,21 @@ pid_to_launchd() {
 # ----------------------------------------------------------------------------
 # DISPLAY: default / status / culprits / wake-history / scheduled
 # ----------------------------------------------------------------------------
-# Default action when no verb is given: the lean view —
-#   "is anything blocking sleep right now?", "what have I disabled?",
-#   "what just happened power-wise?".  No pmset settings / scheduled wakes
-#   header (use 'status' for that).
+# Default action when no verb is given:
+#   - bare:  only the synthesised one-screen summary.
+#   - -D:    full raw view first (culprits + state + 10-event timeline +
+#            wake reasons), then the summary at the bottom.
 action_default() {
+    if [ "$DEBUG" -eq 1 ]; then
+        action_default_raw
+        printf '\n'
+    fi
+    action_summary
+}
+
+# The pre-1.2 default output: raw blocks. Now only printed under -D, or as
+# the body of 'status' which prepends the verbose host/settings header.
+action_default_raw() {
     action_culprits
     printf '\n'
     action_state
@@ -440,17 +469,201 @@ action_status() {
     pmset -g sched 2>/dev/null | sed 's/^/  /'
     printf '\n'
 
-    action_culprits
+    # status is always verbose: include the raw blocks AND the summary,
+    # regardless of -D. -D adds no extra information here.
+    action_default_raw
     printf '\n'
-
-    action_state
-    printf '\n'
-
-    action_wake_history
+    action_summary
     printf '\n'
 
     printf 'Tip:  %s wake-history    %s prevent <name>    %s restore all\n' \
         "$PROG" "$PROG" "$PROG"
+}
+
+# ----------------------------------------------------------------------------
+# SYNTHESISED SUMMARY  (the default top-of-screen output)
+# ----------------------------------------------------------------------------
+# One-screen synthesis of: active blockers, prevented state, recent power
+# events (deduped narrative), and unified-log wake reasons (root only).
+# Designed to answer "is anything weird?" in <20 lines.
+action_summary() {
+    _events_n="${WAKE_HISTORY_EVENTS:-10}"
+    _tmp=$(mktemp 2>/dev/null || printf '/tmp/mpd.sum.%s' "$$")
+    _ev="${_tmp}.events"
+    _dd="${_tmp}.dedup"
+
+    pmset -g log > "$_tmp" 2>/dev/null
+    extract_power_events "$_tmp" > "$_ev"
+    awk -F'\t' '
+        function emit() {
+            if (prev_cat == "") return
+            if (n > 1) {
+                if (first_ts != last_ts)
+                    printf "%s..%s\t%s\t%s (x%d)\n",
+                           first_ts, substr(last_ts, 12), prev_cat, prev_desc, n
+                else
+                    printf "%s\t%s\t%s (x%d)\n",
+                           first_ts, prev_cat, prev_desc, n
+            } else printf "%s\t%s\t%s\n", first_ts, prev_cat, prev_desc
+        }
+        { if ($2==prev_cat && $3==prev_desc) { n++; last_ts=$1; next }
+          emit(); first_ts=$1; last_ts=$1; prev_cat=$2; prev_desc=$3; n=1 }
+        END { emit() }
+    ' "$_ev" > "$_dd"
+
+    printf '== summary ==\n'
+
+    # ---- Right now: active blockers ----
+    _rows=$(parse_assertions | filter_sleep_blockers all)
+    _b_total=0
+    _b_benign=0
+    _b_real=0
+    if [ -n "$_rows" ]; then
+        _b_total=$(printf '%s\n' "$_rows" | awk 'END{print NR}')
+        _bw_tmp=$(mktemp 2>/dev/null || printf '/tmp/mpd.sumbw.%s' "$$")
+        printf '%s\n' "$_rows" > "$_bw_tmp"
+        while IFS='	' read -r _p _n _t _h _a; do
+            [ -n "$_p" ] || continue
+            if _is_benign_blocker "$_n" "$_t" "$_a"; then
+                _b_benign=$((_b_benign + 1))
+            elif is_whitelisted "$_p" "$_n" "" "$_t"; then
+                _b_benign=$((_b_benign + 1))
+            else
+                _b_real=$((_b_real + 1))
+            fi
+        done < "$_bw_tmp"
+        rm -f "$_bw_tmp"
+    fi
+
+    printf '  Right now:\n'
+    if [ "$_b_total" -eq 0 ]; then
+        printf '    - no active sleep blockers\n'
+    elif [ "$_b_real" -eq 0 ]; then
+        printf '    - %s active sleep blocker(s), all benign\n' "$_b_total"
+    else
+        printf '    - %s active sleep blocker(s): %s real, %s benign\n' \
+            "$_b_total" "$_b_real" "$_b_benign"
+    fi
+    if [ "$_b_total" -gt 0 ]; then
+        _bx=$(mktemp 2>/dev/null || printf '/tmp/mpd.sumbx.%s' "$$")
+        printf '%s\n' "$_rows" > "$_bx"
+        while IFS='	' read -r _p _n _t _h _a; do
+            [ -n "$_p" ] || continue
+            _flag=""
+            if _is_benign_blocker "$_n" "$_t" "$_a"; then
+                _flag=' (benign -- "display is on")'
+            elif is_whitelisted "$_p" "$_n" "" "$_t"; then
+                _flag=' (whitelisted)'
+            fi
+            printf '        %s (pid %s) %s, held %s%s\n' \
+                "$_n" "$_p" "$_t" "$_h" "$_flag"
+        done < "$_bx"
+        rm -f "$_bx"
+    fi
+
+    # ---- prevented services ----
+    _sf=$(state_file)
+    _s_count=0
+    if [ -f "$_sf" ] && [ -s "$_sf" ]; then
+        _s_count=$(awk 'END{print NR}' "$_sf")
+    fi
+    if [ "$_s_count" -eq 0 ]; then
+        printf '    - 0 services prevented\n'
+    else
+        printf '    - %s service(s) prevented (see "%s state")\n' "$_s_count" "$PROG"
+    fi
+    printf '\n'
+
+    # ---- Recent activity ----
+    if [ -s "$_dd" ]; then
+        _last_lines=$(tail -n "$_events_n" "$_dd")
+        _first_ts=$(printf '%s\n' "$_last_lines" | head -1 | cut -f1 | cut -c1-16)
+        _last_ts=$(printf '%s\n' "$_last_lines" | tail -1 | cut -f1 | cut -c1-16)
+        _shown=$(printf '%s\n' "$_last_lines" | awk 'END{print NR}')
+        printf '  Recent activity (last %s events, %s -> %s):\n' \
+            "$_shown" "$_first_ts" "$_last_ts"
+        printf '%s\n' "$_last_lines" | awk -F'\t' '{
+            ts = $1
+            # Show just HH:MM (or HH:MM..HH:MM for ranges)
+            if (ts ~ /\.\./) {
+                # "YYYY-MM-DD HH:MM:SS..HH:MM:SS" -> "HH:MM..HH:MM"
+                split(ts, a, "\\.\\.")
+                sub(/^[^ ]+ /, "", a[1])    # strip date
+                sub(/:[0-9][0-9]$/, "", a[1])
+                sub(/:[0-9][0-9]$/, "", a[2])
+                shown = a[1] ".." a[2]
+            } else {
+                sub(/^[^ ]+ /, "", ts)       # strip date
+                sub(/:[0-9][0-9]$/, "", ts)  # strip :SS
+                shown = ts
+            }
+            # Tag category compactly
+            tag = $2
+            if (tag == "DISPLAY-ON")  tag = "display ON "
+            else if (tag == "DISPLAY-OFF") tag = "display OFF"
+            else if (tag == "SLEEP")       tag = "SLEEP      "
+            else if (tag == "WAKE")        tag = "WAKE       "
+            else if (tag == "HIBERNATE")   tag = "HIBERNATE  "
+            else if (tag == "DARK-WAKE")   tag = "dark wake  "
+            else if (tag == "DARK-PROBE")  tag = "dark probe "
+            else if (tag == "PREVENT")     tag = "prevent    "
+            else if (tag == "PREVENT-END") tag = "prev. end  "
+            else if (tag == "CAFFEINATE")  tag = "caffeinate "
+            else if (tag == "NOTIF-WAKE")  tag = "notif. wake"
+            else if (tag == "BATTERY")     tag = "battery    "
+            printf "    %s  %s  %s\n", shown, tag, $3
+        }'
+    else
+        printf '  Recent activity: (no events extracted)\n'
+    fi
+    printf '\n'
+
+    # ---- Wake reasons (root only, grouped) ----
+    printf '  Wake reasons (unified log, last 24h):\n'
+    if is_root; then
+        _wr_tmp="${_tmp}.wr"
+        log show --last 24h --predicate \
+            'eventMessage CONTAINS[c] "Wake reason"' \
+            --style compact 2>/dev/null > "$_wr_tmp" || true
+        if [ ! -s "$_wr_tmp" ]; then
+            printf '    - (no wake-reason events in last 24h)\n'
+        else
+            _wr_total=$(awk 'END{print NR}' "$_wr_tmp")
+            # WiFi (WoW) — group by minute, dedupe (airportd often emits 2-3 lines per wake)
+            _wifi_times=$(awk '/systemWokenByWiFi/ {
+                # timestamp at start: 2026-05-24 21:03:29.624
+                t = $1 " " $2
+                sub(/\..*/, "", t)              # strip .micros
+                sub(/:[0-9][0-9]$/, "", t)      # strip :SS -> minute precision
+                print t
+            }' "$_wr_tmp" | sort -u)
+            _wifi_n=$(printf '%s' "$_wifi_times" | awk 'NF{c++} END{print c+0}')
+            _other_n=$(grep -cv "systemWokenByWiFi" "$_wr_tmp")
+            # ignore our own "log show" self-mention if present
+            _self_n=$(grep -c "log run noninteractively" "$_wr_tmp" 2>/dev/null || printf 0)
+            _other_n=$((_other_n - _self_n))
+            [ "$_other_n" -lt 0 ] && _other_n=0
+
+            if [ "$_wifi_n" -gt 0 ]; then
+                _times_short=$(printf '%s\n' "$_wifi_times" \
+                    | awk '{print substr($2,1,5)}' | tr '\n' ' ' | sed 's/ $//')
+                printf '    - %s distinct Wake-on-WiFi darkwake(s): %s\n' \
+                    "$_wifi_n" "$_times_short"
+                printf '      (airportd "Wake Reason not found" -- housekeeping; no user wake)\n'
+            fi
+            if [ "$_other_n" -gt 0 ]; then
+                printf '    - %s other wake-reason line(s) (use -D for raw)\n' "$_other_n"
+            fi
+            if [ "$_wifi_n" -eq 0 ] && [ "$_other_n" -eq 0 ]; then
+                printf '    - %s line(s), none classifiable\n' "$_wr_total"
+            fi
+        fi
+        rm -f "$_wr_tmp"
+    else
+        printf '    - (run as root for unified-log wake reasons)\n'
+    fi
+
+    rm -f "$_tmp" "$_ev" "$_dd"
 }
 
 
