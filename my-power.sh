@@ -36,7 +36,7 @@
 set -u
 
 PROG="my-power-doctor"
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 # ----------------------------------------------------------------------------
 # DEFAULTS (overridable by config file)
@@ -577,8 +577,8 @@ action_summary() {
     # ---- Recent activity ----
     if [ -s "$_dd" ]; then
         _last_lines=$(tail -n "$_events_n" "$_dd")
-        _first_ts=$(printf '%s\n' "$_last_lines" | head -1 | cut -f1 | cut -c1-16)
-        _last_ts=$(printf '%s\n' "$_last_lines" | tail -1 | cut -f1 | cut -c1-16)
+        _first_ts=$(printf '%s\n' "$_last_lines" | head -n 1 | cut -f1 | cut -c1-16)
+        _last_ts=$(printf '%s\n' "$_last_lines" | tail -n 1 | cut -f1 | cut -c1-16)
         _shown=$(printf '%s\n' "$_last_lines" | awk 'END{print NR}')
         printf '  Recent activity (last %s events, %s -> %s):\n' \
             "$_shown" "$_first_ts" "$_last_ts"
@@ -641,19 +641,57 @@ action_summary() {
         if [ ! -s "$_wr_tmp" ]; then
             printf '    - (no sleep/wake/hibernate events in last 24h)\n'
         else
-            # Distinct-minute time-lists per category.
-            _sleep_times=$(awk '/Entering Sleep|Going to sleep|Sleep transition.*to[[:space:]]+Sleep|PMRD: System Sleep/ {
-                t = $1 " " $2; sub(/\..*/, "", t); sub(/:[0-9][0-9]$/, "", t); print t
-            }' "$_wr_tmp" | sort -u)
-            _wake_times=$(awk '!/systemWokenByWiFi/ && (/Wake reason/ || /Wake from/ || /PMRD: System Wake/) {
-                t = $1 " " $2; sub(/\..*/, "", t); sub(/:[0-9][0-9]$/, "", t); print t
-            }' "$_wr_tmp" | sort -u)
-            _wifi_times=$(awk '/systemWokenByWiFi/ {
-                t = $1 " " $2; sub(/\..*/, "", t); sub(/:[0-9][0-9]$/, "", t); print t
-            }' "$_wr_tmp" | sort -u)
-            _hib_times=$(awk '/Hibernate/ {
-                t = $1 " " $2; sub(/\..*/, "", t); sub(/:[0-9][0-9]$/, "", t); print t
-            }' "$_wr_tmp" | sort -u)
+            # Classify each line into one bucket and emit "BUCKET\tHH:MM".
+            # Three sources of bugs the older per-bucket awks had:
+            #   1. Continuation lines of powerd's multi-line "Settings
+            #      change for power source" dumps were time-extracted
+            #      from garbage (e.g. `"Hibernate File"` -> `File"`).
+            #      Fix: only consider lines that START with a timestamp.
+            #   2. WindowServer logs "System going to sleep" (lowercase),
+            #      but the awk patterns were case-sensitive while the
+            #      predicate's CONTAINS[c] is case-insensitive.
+            #      Fix: tolower() before matching.
+            #   3. `Setting Hibernate mode to 3` and `"Hibernate File"` /
+            #      `"Hibernate Mode"` are config noise, not hibernate
+            #      transitions.  Tighten the hibernate match to real
+            #      transition verbs and explicitly exclude the config
+            #      strings.
+            _class=$(awk '
+                function ts_to_minute(line) {
+                    if (!match(line, /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]/))
+                        return ""
+                    return substr(line, RSTART, RLENGTH)
+                }
+                {
+                    m = ts_to_minute($0); if (m == "") next
+                    low = tolower($0)
+
+                    if (low ~ /systemwokenbywifi/) { print "WIFI\t" m; next }
+
+                    if (low ~ /entering sleep|going to sleep|sleep transition.*to[[:space:]]+sleep|pmrd: system sleep/) {
+                        print "SLEEP\t" m; next
+                    }
+
+                    if (low ~ /wake reason|wake from|pmrd: system wake/) {
+                        print "WAKE\t" m; next
+                    }
+
+                    if (low ~ /hibernate/) {
+                        # Exclude config-string noise that just mentions
+                        # the word "Hibernate" without being a transition.
+                        if ($0 ~ /Setting Hibernate mode|"Hibernate File"|"Hibernate Mode"|HibernateMode/) next
+                        # Real transition phrases only.
+                        if (low ~ /going to hibernate|hibernating|hibernate image|hibernate restore|hibernate complete|sleepimage/) {
+                            print "HIB\t" m; next
+                        }
+                    }
+                }
+            ' "$_wr_tmp" | sort -u)
+
+            _sleep_times=$(printf '%s\n' "$_class" | awk -F'\t' '$1=="SLEEP"{print $2}')
+            _wake_times=$( printf '%s\n' "$_class" | awk -F'\t' '$1=="WAKE" {print $2}')
+            _wifi_times=$( printf '%s\n' "$_class" | awk -F'\t' '$1=="WIFI" {print $2}')
+            _hib_times=$(  printf '%s\n' "$_class" | awk -F'\t' '$1=="HIB"  {print $2}')
 
             _sleep_n=$(printf '%s' "$_sleep_times" | awk 'NF{c++} END{print c+0}')
             _wake_n=$( printf '%s' "$_wake_times"  | awk 'NF{c++} END{print c+0}')
