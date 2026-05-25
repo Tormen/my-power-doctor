@@ -36,7 +36,7 @@
 set -u
 
 PROG="my-power-doctor"
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 # ----------------------------------------------------------------------------
 # DEFAULTS (overridable by config file)
@@ -659,59 +659,56 @@ action_summary() {
             #      transitions.  Tighten the hibernate match to real
             #      transition verbs and explicitly exclude the config
             #      strings.
+            # Emit rows as "TIMESTAMP\tBUCKET" so a chronological sort gives
+            # us both event ordering AND deterministic ordering of distinct
+            # events at the same second.  Timestamp precision is seconds
+            # (YYYY-MM-DD HH:MM:SS) so the timeline phase-builder can
+            # measure durations accurately.
             _class=$(awk '
-                function ts_to_minute(line) {
-                    if (!match(line, /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]/))
+                function ts_to_seconds(line) {
+                    if (!match(line, /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/))
                         return ""
                     return substr(line, RSTART, RLENGTH)
                 }
                 {
-                    m = ts_to_minute($0); if (m == "") next
+                    t = ts_to_seconds($0); if (t == "") next
                     low = tolower($0)
 
-                    # WiFi housekeeping (subset of "Wake reason" output).
-                    if (low ~ /systemwokenbywifi/) { print "WIFI\t" m; next }
+                    if (low ~ /systemwokenbywifi/) { print t "\tWIFI"; next }
 
-                    # Lid open / close (powerd:displayState ClamshellState).
-                    if (low ~ /clamshellstate.*closed[[:space:]]*:[[:space:]]*1/) { print "LID-CLOSE\t" m; next }
-                    if (low ~ /clamshellstate.*closed[[:space:]]*:[[:space:]]*0/) { print "LID-OPEN\t"  m; next }
+                    if (low ~ /clamshellstate.*closed[[:space:]]*:[[:space:]]*1/) { print t "\tLID-CLOSE"; next }
+                    if (low ~ /clamshellstate.*closed[[:space:]]*:[[:space:]]*0/) { print t "\tLID-OPEN";  next }
 
-                    # Power source changes (powerd:pmSettings).
-                    if (low ~ /settings change for power source change to ac power/)      { print "AC\t"   m; next }
-                    if (low ~ /settings change for power source change to battery power/) { print "BATT\t" m; next }
+                    if (low ~ /settings change for power source change to ac power/)      { print t "\tAC";   next }
+                    if (low ~ /settings change for power source change to battery power/) { print t "\tBATT"; next }
 
-                    # PerfMode-based sleep/wake.  Authoritative for builds
-                    # that do not emit explicit "Wake reason" / "Going to
-                    # sleep" lines (macOS 25.x).  Restricted = asleep.
-                    if (low ~ /current perfmode: unrestricted, target perfmode: restricted/) { print "SLEEP\t" m; next }
-                    if (low ~ /current perfmode: restricted, target perfmode: unrestricted/) { print "WAKE\t"  m; next }
+                    if (low ~ /current perfmode: unrestricted, target perfmode: restricted/) { print t "\tSLEEP"; next }
+                    if (low ~ /current perfmode: restricted, target perfmode: unrestricted/) { print t "\tWAKE";  next }
 
-                    # Text-based sleep / wake (older or non-powerd sources).
                     if (low ~ /entering sleep|going to sleep|sleep transition.*to[[:space:]]+sleep|pmrd: system sleep/) {
-                        print "SLEEP\t" m; next
+                        print t "\tSLEEP"; next
                     }
                     if (low ~ /wake reason|wake from|pmrd: system wake/) {
-                        print "WAKE\t" m; next
+                        print t "\tWAKE"; next
                     }
 
-                    # Hibernate transitions (NOT config-string noise).
                     if (low ~ /hibernate/) {
                         if ($0 ~ /Setting Hibernate mode|"Hibernate File"|"Hibernate Mode"|HibernateMode/) next
                         if (low ~ /going to hibernate|hibernating|hibernate image|hibernate restore|hibernate complete|sleepimage/) {
-                            print "HIB\t" m; next
+                            print t "\tHIB"; next
                         }
                     }
                 }
             ' "$_wr_tmp" | sort -u)
 
-            _sleep_times=$(    printf '%s\n' "$_class" | awk -F'\t' '$1=="SLEEP"     {print $2}')
-            _wake_times=$(     printf '%s\n' "$_class" | awk -F'\t' '$1=="WAKE"      {print $2}')
-            _wifi_times=$(     printf '%s\n' "$_class" | awk -F'\t' '$1=="WIFI"      {print $2}')
-            _hib_times=$(      printf '%s\n' "$_class" | awk -F'\t' '$1=="HIB"       {print $2}')
-            _lid_close_times=$(printf '%s\n' "$_class" | awk -F'\t' '$1=="LID-CLOSE" {print $2}')
-            _lid_open_times=$( printf '%s\n' "$_class" | awk -F'\t' '$1=="LID-OPEN"  {print $2}')
-            _ac_times=$(       printf '%s\n' "$_class" | awk -F'\t' '$1=="AC"        {print $2}')
-            _batt_times=$(     printf '%s\n' "$_class" | awk -F'\t' '$1=="BATT"      {print $2}')
+            _sleep_times=$(    printf '%s\n' "$_class" | awk -F'\t' '$2=="SLEEP"     {print $1}')
+            _wake_times=$(     printf '%s\n' "$_class" | awk -F'\t' '$2=="WAKE"      {print $1}')
+            _wifi_times=$(     printf '%s\n' "$_class" | awk -F'\t' '$2=="WIFI"      {print $1}')
+            _hib_times=$(      printf '%s\n' "$_class" | awk -F'\t' '$2=="HIB"       {print $1}')
+            _lid_close_times=$(printf '%s\n' "$_class" | awk -F'\t' '$2=="LID-CLOSE" {print $1}')
+            _lid_open_times=$( printf '%s\n' "$_class" | awk -F'\t' '$2=="LID-OPEN"  {print $1}')
+            _ac_times=$(       printf '%s\n' "$_class" | awk -F'\t' '$2=="AC"        {print $1}')
+            _batt_times=$(     printf '%s\n' "$_class" | awk -F'\t' '$2=="BATT"      {print $1}')
 
             _sleep_n=$(    printf '%s' "$_sleep_times"     | awk 'NF{c++} END{print c+0}')
             _wake_n=$(     printf '%s' "$_wake_times"      | awk 'NF{c++} END{print c+0}')
@@ -773,6 +770,80 @@ action_summary() {
                     && [ "$_ac_n" -eq 0 ] && [ "$_batt_n" -eq 0 ]; then
                 printf '    - %s line(s), none classifiable (use -D for raw)\n' \
                     "$(awk 'END{print NR}' "$_wr_tmp")"
+            fi
+
+            # ---- Power-state TIMELINE ----
+            # Reconstruct the AWAKE / SLEEP / HIBERNATE phase machine from
+            # the classified events.  SLEEP / WAKE / HIB events change
+            # state; WIFI / LID-* / AC / BATT events annotate the current
+            # phase.  Each phase is emitted as TAB-separated:
+            #     T_START \t T_END \t STATE \t ANNOTATIONS
+            # then the shell loop formats with human-readable durations.
+            _phases=$(printf '%s\n' "$_class" | awk -F'\t' '
+                function emit(state, t1, t2, ann) {
+                    if (state == "" || t1 == "") return
+                    print t1 "\t" t2 "\t" state "\t" ann
+                }
+                BEGIN { state = ""; phase_start = ""; ann = "" }
+                {
+                    ts = $1; cat = $2
+                    if (cat == "SLEEP" || cat == "WAKE" || cat == "HIB") {
+                        newstate = (cat == "SLEEP") ? "SLEEP" : \
+                                   (cat == "WAKE")  ? "AWAKE" : "HIBERNATE"
+                        if (newstate != state) {
+                            emit(state, phase_start, ts, ann)
+                            state = newstate; phase_start = ts; ann = ""
+                        }
+                        next
+                    }
+                    # Annotation events — attach to current phase.
+                    label = cat
+                    if (cat == "WIFI")      label = "WoW"
+                    if (cat == "LID-CLOSE") label = "lid-CLOSE"
+                    if (cat == "LID-OPEN")  label = "lid-OPEN"
+                    if (cat == "BATT")      label = "->battery"
+                    if (cat == "AC")        label = "->AC"
+                    ann = ann " " label "@" substr(ts, 12, 5)
+                }
+                END { emit(state, phase_start, "now", ann) }
+            ')
+
+            if [ -n "$_phases" ]; then
+                printf '\n  Power state timeline (last 24h, oldest first):\n'
+                _now=$(date '+%Y-%m-%d %H:%M:%S')
+                _now_epoch=$(date '+%s')
+                # POSIX-safe field walk; can't use a here-string in dash.
+                _pt=$(mktemp 2>/dev/null || printf '/tmp/mpd.pt.%s' "$$")
+                printf '%s\n' "$_phases" > "$_pt"
+                while IFS='	' read -r _t1 _t2 _state _ann; do
+                    [ -n "$_t1" ] || continue
+                    if [ "$_t2" = "now" ]; then
+                        _t2_disp="now"
+                        _e2="$_now_epoch"
+                    else
+                        _t2_disp=$(printf '%s' "$_t2" | cut -c12-16)
+                        _e2=$(date -j -f '%Y-%m-%d %H:%M:%S' "$_t2" '+%s' 2>/dev/null || echo 0)
+                    fi
+                    _t1_disp=$(printf '%s' "$_t1" | cut -c12-16)
+                    _e1=$(date -j -f '%Y-%m-%d %H:%M:%S' "$_t1" '+%s' 2>/dev/null || echo 0)
+                    _diff=$((_e2 - _e1))
+                    if [ "$_diff" -lt 0 ]; then _diff=0; fi
+                    if   [ "$_diff" -lt 60 ];   then _dur=$(printf '%ds' "$_diff")
+                    elif [ "$_diff" -lt 3600 ]; then _dur=$(printf '%dm %ds' $((_diff / 60)) $((_diff % 60)))
+                    elif [ "$_diff" -lt 86400 ];then _dur=$(printf '%dh %dm' $((_diff / 3600)) $(((_diff % 3600) / 60)))
+                    else                              _dur=$(printf '%dd %dh' $((_diff / 86400)) $(((_diff % 86400) / 3600)))
+                    fi
+                    # Trim leading space from annotations.
+                    _ann_trim=$(printf '%s' "$_ann" | sed 's/^ *//')
+                    if [ -n "$_ann_trim" ]; then
+                        printf '    %s -> %-5s  %-9s  (%s)  -- %s\n' \
+                            "$_t1_disp" "$_t2_disp" "$_state" "$_dur" "$_ann_trim"
+                    else
+                        printf '    %s -> %-5s  %-9s  (%s)\n' \
+                            "$_t1_disp" "$_t2_disp" "$_state" "$_dur"
+                    fi
+                done < "$_pt"
+                rm -f "$_pt"
             fi
         fi
         rm -f "$_wr_tmp"
