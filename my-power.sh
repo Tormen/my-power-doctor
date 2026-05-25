@@ -36,7 +36,7 @@
 set -u
 
 PROG="my-power-doctor"
-VERSION="1.4.1"
+VERSION="1.5.0"
 
 # ----------------------------------------------------------------------------
 # DEFAULTS (overridable by config file)
@@ -93,6 +93,9 @@ CONFIG_FILE=""           # resolved
 CONFIG_FILE_ARG=""       # if user gave --config
 ACTION=""
 SELECTOR=""
+SET_KNOB=""              # 'set' action: knob short-name
+SET_VAL=""               # 'set' action: new value
+SET_SCOPE="-a"           # 'set' action: pmset scope (-a/-b/-c/-u)
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -167,6 +170,14 @@ ACTIONS:
                             Survives restart until 'restore'.
     restore <selector|all>  Re-enable previously prevented services.
     state                   Show what we've disabled & when.
+    get [<short>]           Show pmset power-management knobs by CLI short-
+                            name with their current value and description.
+                            With no arg: full table. With <short>: one row.
+    set <short> <val> [-b|-c|-u]
+                            Set a knob (root required). Default scope -a
+                            (all sources). -b = battery only, -c = AC/charger,
+                            -u = UPS. Prints the old value before changing.
+                            Example: sudo my-power set tka 0   (disable WoW)
 
 SELECTORS:
     all                     Every non-whitelisted blocker.
@@ -428,6 +439,148 @@ pid_to_launchd() {
 }
 
 # ----------------------------------------------------------------------------
+# POWER KNOBS  (pmset settings, short-name registry)
+# ----------------------------------------------------------------------------
+# Single source of truth: SHORT<TAB>pmset_name<TAB>description
+# Add a row here and it appears in `get`, `set`, and the summary.  No
+# other code references these names individually.
+knob_table() {
+    cat <<'EOF'
+tka	tcpkeepalive	keep TCP alive during sleep (Wake-on-WiFi driver)
+pn	powernap	Power Nap (umbrella: sleep-time maintenance/iCloud sync)
+dw	darkwakes	background tasks during darkwake (Time Machine, iCloud, ...)
+nos	networkoversleep	stay awake while a network connection is in use
+womp	womp	Wake-On-LAN magic packet (Ethernet)
+pw	proximitywake	wake when a nearby iPhone receives a call/message
+ds	displaysleep	display sleep timer (minutes; 0 = never)
+disks	disksleep	disk spindown timer (minutes; 0 = never)
+sleep	sleep	system sleep timer (minutes; 0 = never / disabled)
+hib	hibernatemode	0 = sleep only, 3 = safe sleep (default), 25 = hibernate only
+tts	ttyskeepawake	stay awake while an SSH/TTY session is open
+lid	lidwake	wake on lid open
+acwake	acwake	wake when AC power source changes
+sb	standby	enable standby (deep sleep after standbydelay)
+EOF
+}
+
+# Echo "FULL_NAME<TAB>DESCRIPTION" for SHORT, empty on miss.
+knob_lookup() {
+    knob_table | awk -F'\t' -v s="$1" '$1==s {print $2 "\t" $3; exit}'
+}
+
+# Echo SHORT for FULL_NAME, empty on miss (used by status to label rows).
+knob_short_for_full() {
+    knob_table | awk -F'\t' -v f="$1" '$2==f {print $1; exit}'
+}
+
+# Print every knob with its currently-active value (one row per knob).
+# Used by both `my-power get` (full table) and the summary (compact view).
+# Reads pmset -g once and joins.
+_print_knob_table() {
+    _mode="${1:-full}"  # "full" or "compact"
+    # Active settings + per-source defaults — some knobs (lidwake,
+    # acwake, darkwakes, proximitywake, ...) only appear in -g custom.
+    _pg=$( { pmset -g 2>/dev/null; pmset -g custom 2>/dev/null; } )
+    if [ "$_mode" = "full" ]; then
+        printf '  %-6s %-20s %-5s %s\n' 'short' 'pmset-name' 'now' 'description'
+        printf '  %-6s %-20s %-5s %s\n' '------' '--------------------' '-----' \
+            '------------------------------------------------'
+    fi
+    knob_table | while IFS='	' read -r _s _f _d; do
+        [ -n "$_s" ] || continue
+        _v=$(printf '%s\n' "$_pg" | awk -v k="$_f" '
+            # pmset -g rows look like "   tcpkeepalive         1".  Match
+            # exact first field; emit the second whitespace-separated token.
+            $1==k { print $2; exit }
+        ')
+        printf '  %-6s %-20s %-5s %s\n' "$_s" "$_f" "${_v:-?}" "$_d"
+    done
+}
+
+action_get() {
+    if [ -n "$SELECTOR" ]; then
+        # Single-knob mode
+        _info=$(knob_lookup "$SELECTOR")
+        if [ -z "$_info" ]; then
+            warn "unknown knob short-name: '$SELECTOR'"
+            printf '\nKnown knobs:\n' >&2
+            knob_table | awk -F'\t' '{printf "  %-6s %s\n", $1, $2}' >&2
+            exit 2
+        fi
+        _full=$(printf '%s' "$_info" | cut -f1)
+        _desc=$(printf '%s' "$_info" | cut -f2)
+        _v=$( { pmset -g 2>/dev/null; pmset -g custom 2>/dev/null; } \
+            | awk -v k="$_full" '$1==k {print $2; exit}')
+        printf '== power knob: %s ==\n' "$SELECTOR"
+        printf '  short:      %s\n' "$SELECTOR"
+        printf '  pmset name: %s\n' "$_full"
+        printf '  current:    %s\n' "${_v:-?}"
+        printf '  meaning:    %s\n' "$_desc"
+        printf '\n  Set with:   sudo %s set %s <value> [-b|-c|-u]\n' \
+            "$PROG" "$SELECTOR"
+        return 0
+    fi
+    printf '== power knobs (active values) ==\n'
+    _print_knob_table full
+    printf '\n  Set with:    sudo %s set <short> <value> [-b|-c|-u]\n' "$PROG"
+    printf '  Examples:    sudo %s set tka 0          # disable Wake-on-WiFi globally\n' \
+        "$PROG"
+    printf '               sudo %s set ds 5 -b        # 5-min display sleep on battery only\n' \
+        "$PROG"
+    printf '               sudo %s set pn 0           # disable Power Nap\n' \
+        "$PROG"
+    printf '\n  Power-source scope:  -a all (default)  -b battery  -c AC/charger  -u UPS\n'
+}
+
+action_set() {
+    is_root || die "set requires root (re-run with sudo)"
+    [ -n "${SET_KNOB:-}" ] || die "set: <short> required (see 'my-power get' for list)"
+    [ -n "${SET_VAL:-}" ]  || die "set: <value> required"
+
+    _info=$(knob_lookup "$SET_KNOB")
+    if [ -z "$_info" ]; then
+        warn "unknown knob short-name: '$SET_KNOB'"
+        printf '\nKnown knobs:\n' >&2
+        knob_table | awk -F'\t' '{printf "  %-6s %s\n", $1, $2}' >&2
+        exit 2
+    fi
+    _full=$(printf '%s' "$_info" | cut -f1)
+    _desc=$(printf '%s' "$_info" | cut -f2)
+
+    # Validate value: pmset knobs all take non-negative integers.
+    case "$SET_VAL" in
+        ''|*[!0-9]*) die "set: value must be a non-negative integer (got '$SET_VAL')" ;;
+    esac
+
+    _old=$( { pmset -g 2>/dev/null; pmset -g custom 2>/dev/null; } \
+        | awk -v k="$_full" '$1==k {print $2; exit}')
+    _scope="${SET_SCOPE:--a}"
+    _scope_desc="all sources"
+    case "$_scope" in
+        -b) _scope_desc="battery only" ;;
+        -c) _scope_desc="AC/charger only" ;;
+        -u) _scope_desc="UPS only" ;;
+        -a) _scope_desc="all sources" ;;
+    esac
+
+    printf '%s: set %s (%s) from %s to %s, scope=%s\n' \
+        "$PROG" "$SET_KNOB" "$_full" "${_old:-?}" "$SET_VAL" "$_scope_desc"
+    printf '       (%s)\n' "$_desc"
+    printf '       command: pmset %s %s %s\n' "$_scope" "$_full" "$SET_VAL"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '       (dry-run; not running)\n'
+        return 0
+    fi
+    pmset "$_scope" "$_full" "$SET_VAL" \
+        || die "pmset $_scope $_full $SET_VAL failed (exit $?)"
+
+    _new=$( { pmset -g 2>/dev/null; pmset -g custom 2>/dev/null; } \
+        | awk -v k="$_full" '$1==k {print $2; exit}')
+    printf '       OK; %s is now: %s\n' "$_full" "${_new:-?}"
+}
+
+# ----------------------------------------------------------------------------
 # DISPLAY: default / status / culprits / wake-history / scheduled
 # ----------------------------------------------------------------------------
 # Default action when no verb is given:
@@ -572,6 +725,12 @@ action_summary() {
     else
         printf '    - %s service(s) prevented (see "%s state")\n' "$_s_count" "$PROG"
     fi
+    printf '\n'
+
+    # ---- Power knobs (short-name -> pmset name -> current value -> meaning) ----
+    printf '  Power knobs (short = pmset name; toggle with: sudo %s set <short> <value>):\n' \
+        "$PROG"
+    _print_knob_table full
     printf '\n'
 
     # ---- Recent activity ----
@@ -1590,13 +1749,42 @@ parse_args() {
 
     if [ $# -eq 0 ]; then
         ACTION="default"
-    else
-        ACTION="$1"; shift
-        if [ $# -gt 0 ]; then
-            SELECTOR="$1"; shift
-        fi
-        [ $# -eq 0 ] || die "trailing arguments: $*"
+        return 0
     fi
+    ACTION="$1"; shift
+
+    # Action-specific arg handling.  `set` needs three positionals + an
+    # optional scope flag; `get` takes an optional positional; everything
+    # else uses the legacy "one SELECTOR" form.
+    case "$ACTION" in
+        set)
+            [ $# -ge 2 ] || die "set: need <short> <value>  (e.g. set tka 0)"
+            SET_KNOB="$1"; SET_VAL="$2"; shift 2
+            SET_SCOPE="-a"
+            if [ $# -ge 1 ]; then
+                case "$1" in
+                    -a|--all)              SET_SCOPE="-a"; shift ;;
+                    -b|--battery)          SET_SCOPE="-b"; shift ;;
+                    -c|--charger|--ac)     SET_SCOPE="-c"; shift ;;
+                    -u|--ups)              SET_SCOPE="-u"; shift ;;
+                    -*) die "set: unknown scope flag '$1' (use -a/-b/-c/-u)" ;;
+                esac
+            fi
+            [ $# -eq 0 ] || die "set: trailing arguments: $*"
+            ;;
+        get)
+            if [ $# -ge 1 ]; then
+                SELECTOR="$1"; shift
+            fi
+            [ $# -eq 0 ] || die "get: trailing arguments: $*"
+            ;;
+        *)
+            if [ $# -gt 0 ]; then
+                SELECTOR="$1"; shift
+            fi
+            [ $# -eq 0 ] || die "trailing arguments: $*"
+            ;;
+    esac
 }
 
 # ----------------------------------------------------------------------------
@@ -1628,6 +1816,8 @@ debug=$DEBUG dry-run=$DRY_RUN force=$FORCE"
         prevent)       action_prevent ;;
         restore)       action_restore ;;
         state)         action_state ;;
+        get)           action_get ;;
+        set)           action_set ;;
         *)             usage >&2; die "unknown action: $ACTION" ;;
     esac
 }
