@@ -81,7 +81,8 @@ WAKE_HISTORY_LINES=40
 WAKE_HISTORY_EVENTS=10
 
 # Config file resolution (first existing wins)
-CONFIG_SEARCH="/LINKS/default/my-power-doctor.conf ${HOME}/.my-power-doctor.conf /etc/my-power-doctor.conf /usr/local/etc/my-power-doctor.conf"
+# both spellings are accepted under /LINKS/default: .conf first, then bare
+CONFIG_SEARCH="/LINKS/default/my-power-doctor.conf /LINKS/default/my-power-doctor ${HOME}/.my-power-doctor.conf /etc/my-power-doctor.conf /usr/local/etc/my-power-doctor.conf"
 
 # ----------------------------------------------------------------------------
 # Runtime state
@@ -209,7 +210,7 @@ GLOBAL OPTS:
     -V | --version          Print version.
 
 CONFIG SEARCH ORDER (first hit wins):
-    /LINKS/default/$PROG.conf
+    /LINKS/default/$PROG.conf   (or /LINKS/default/$PROG)
     ~/.$PROG.conf
     /etc/$PROG.conf
     /usr/local/etc/$PROG.conf
