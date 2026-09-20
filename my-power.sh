@@ -42,8 +42,8 @@ PROG="my-power-doctor"
 # tag>-<commits since it>-g<short sha>); both are written by 'stamp-version',
 # so a deployed copy with no git can still say what it is.
 VERSION="1.5.2"
-SCRIPT_COMMIT="9dcc8cb"
-SCRIPT_RELEASE="v1.5.2-5-g9dcc8cb"
+SCRIPT_COMMIT="af4a2d6"
+SCRIPT_RELEASE="v1.5.2-6-gaf4a2d6"
 
 # The first 12 hex of this file's own SHA-256: the value that identifies the
 # bytes, so comparing two installs is running --version on each and diffing.
@@ -85,7 +85,10 @@ _version_string() {
        && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
       _vs_d=""
     fi
-    [ -n "$_vs_d" ] || _vs_d=$SCRIPT_RELEASE
+    # The stamp is a PAIR, written together: without SCRIPT_COMMIT there is no
+    # stamp to fall back to, and a lone SCRIPT_RELEASE would be a release claim
+    # nothing backs -- an unstamped file says so.
+    if [ -z "$_vs_d" ] && [ -n "$SCRIPT_COMMIT" ]; then _vs_d=$SCRIPT_RELEASE; fi
     case "$_vs_d" in
         *-*-g*)
             _vs_t=${_vs_d%-*-g*}
