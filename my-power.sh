@@ -42,8 +42,8 @@ PROG="my-power-doctor"
 # tag>-<commits since it>-g<short sha>); both are written by 'stamp-version',
 # so a deployed copy with no git can still say what it is.
 VERSION="1.5.2"
-SCRIPT_COMMIT="a2d8caa"
-SCRIPT_RELEASE="v1.5.2-3-ga2d8caa"
+SCRIPT_COMMIT="ba62dbd"
+SCRIPT_RELEASE="v1.5.2-4-gba62dbd"
 
 # The first 12 hex of this file's own SHA-256: the value that identifies the
 # bytes, so comparing two installs is running --version on each and diffing.
@@ -58,9 +58,25 @@ _build_id() {
 # Git first (exact in a checkout), the stamp second: the stamp is written
 # BEFORE the release is tagged, so it lags one release step, and a deployed
 # copy has no git at all.
+# The directory holding the REAL file, symlinks resolved. /LINKS/bin/<tool> is
+# a farm link into ANOTHER repo, so asking git from there answers about THAT
+# repo -- and once it has a tag of its own, this tool would report a stranger's
+# release as its own.
+_self_dir() {
+  _sd_p=$0
+  while [ -L "$_sd_p" ]; do
+    _sd_t=$(readlink "$_sd_p") || break
+    case "$_sd_t" in
+      /*) _sd_p=$_sd_t ;;
+      *)  _sd_p=$(dirname "$_sd_p")/$_sd_t ;;
+    esac
+  done
+  (cd "$(dirname "$_sd_p")" 2>/dev/null && pwd -P)
+}
+
 _version_string() {
     _vs_b=$(_build_id)
-    _vs_d=$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)
+    _vs_d=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
     [ -n "$_vs_d" ] || _vs_d=$SCRIPT_RELEASE
     case "$_vs_d" in
         *-*-g*)
