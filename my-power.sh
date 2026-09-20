@@ -42,8 +42,8 @@ PROG="my-power-doctor"
 # tag>-<commits since it>-g<short sha>); both are written by 'stamp-version',
 # so a deployed copy with no git can still say what it is.
 VERSION="1.5.2"
-SCRIPT_COMMIT="ba62dbd"
-SCRIPT_RELEASE="v1.5.2-4-gba62dbd"
+SCRIPT_COMMIT="9dcc8cb"
+SCRIPT_RELEASE="v1.5.2-5-g9dcc8cb"
 
 # The first 12 hex of this file's own SHA-256: the value that identifies the
 # bytes, so comparing two installs is running --version on each and diffing.
@@ -77,6 +77,14 @@ _self_dir() {
 _version_string() {
     _vs_b=$(_build_id)
     _vs_d=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
+    # describe answers about WHERE this file sits, not about what it is: a copy
+    # dropped in a foreign repo gets THAT repo's tags (/LINKS/global is one, and
+    # it holds the copies update-LINKS promotes). The stamped commit is the
+    # proof -- a repo that does not have it is not this tool's repo.
+    if [ -n "$_vs_d" ] && [ -n "$SCRIPT_COMMIT" ] \
+       && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
+      _vs_d=""
+    fi
     [ -n "$_vs_d" ] || _vs_d=$SCRIPT_RELEASE
     case "$_vs_d" in
         *-*-g*)
