@@ -36,7 +36,90 @@
 set -u
 
 PROG="my-power-doctor"
+# VERSION names the release these bytes are BASED on -- only a release commit
+# sets it. SCRIPT_COMMIT is the commit this file was released from and
+# SCRIPT_RELEASE what 'git describe --tags --long' said then (<nearest
+# tag>-<commits since it>-g<short sha>); both are written by 'stamp-version',
+# so a deployed copy with no git can still say what it is.
 VERSION="1.5.2"
+SCRIPT_COMMIT="a2d8caa"
+SCRIPT_RELEASE="v1.5.2-3-ga2d8caa"
+
+# The first 12 hex of this file's own SHA-256: the value that identifies the
+# bytes, so comparing two installs is running --version on each and diffing.
+_build_id() {
+    _bi=$(shasum -a 256 "$0" 2>/dev/null | cut -c1-12)
+    [ -n "$_bi" ] || _bi=$(cksum < "$0" 2>/dev/null | cut -d" " -f1)
+    printf '%s' "${_bi:-unknown}"
+}
+
+# my-power-doctor 1.5.2 (v1.5.2-0-gcc7585d: the v1.5.2 tag, build 1a2b3c4d5e6f)
+# my-power-doctor 1.5.2+2 (v1.5.2-2-g...: 2 commit(s) past v1.5.2, unreleased, ..)
+# Git first (exact in a checkout), the stamp second: the stamp is written
+# BEFORE the release is tagged, so it lags one release step, and a deployed
+# copy has no git at all.
+_version_string() {
+    _vs_b=$(_build_id)
+    _vs_d=$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)
+    [ -n "$_vs_d" ] || _vs_d=$SCRIPT_RELEASE
+    case "$_vs_d" in
+        *-*-g*)
+            _vs_t=${_vs_d%-*-g*}
+            _vs_n=${_vs_d%-g*}; _vs_n=${_vs_n##*-}
+            if [ "$_vs_n" = 0 ]; then
+                printf '%s %s (%s: the %s tag, build %s)\n' "$PROG" "$VERSION" "$_vs_d" "$_vs_t" "$_vs_b"
+            else
+                printf '%s %s+%s (%s: %s commit(s) past %s, unreleased, build %s)\n' \
+                    "$PROG" "$VERSION" "$_vs_n" "$_vs_d" "$_vs_n" "$_vs_t" "$_vs_b"
+            fi ;;
+        *)
+            if [ -n "$SCRIPT_COMMIT" ]; then
+                printf '%s %s (commit %s, build %s)\n' "$PROG" "$VERSION" "$SCRIPT_COMMIT" "$_vs_b"
+            else
+                printf '%s %s (build %s, unstamped)\n' "$PROG" "$VERSION" "$_vs_b"
+            fi ;;
+    esac
+}
+
+# Record HEAD and git's describe string in this file, then AMEND the commit
+# they belong to. Run it after committing and BEFORE pushing (the amend
+# rewrites the commit); tag afterwards, or the tag lands on the commit the
+# amend replaced. The stamped sha lags HEAD by one, which is expected.
+_stamp_version() {
+    _sv_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || { echo "stamp-version: cannot resolve my own directory" >&2; exit 1; }
+    _sv_self="$_sv_dir/$(basename "$0")"
+    git -C "$_sv_dir" rev-parse --git-dir >/dev/null 2>&1 \
+        || { echo "stamp-version: not a git checkout -- nothing to stamp" >&2; exit 1; }
+    _sv_sha=$(git -C "$_sv_dir" rev-parse --short HEAD 2>/dev/null)
+    [ -n "$_sv_sha" ] || { echo "stamp-version: no commit to stamp from" >&2; exit 1; }
+    if git -C "$_sv_dir" rev-parse -q --verify '@{upstream}' >/dev/null 2>&1 \
+       && git -C "$_sv_dir" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null; then
+        echo "stamp-version: HEAD $_sv_sha is already pushed -- amending it would rewrite published history. Commit, stamp, THEN push." >&2
+        exit 1
+    fi
+    _sv_staged=$(git -C "$_sv_dir" diff --cached --name-only 2>/dev/null)
+    if [ -n "$_sv_staged" ]; then
+        echo "stamp-version: something is staged -- the amend would fold it in:" >&2
+        printf '%s\n' "$_sv_staged" | sed 's/^/    > /' >&2
+        exit 1
+    fi
+    git -C "$_sv_dir" diff --quiet -- "$(basename "$0")" 2>/dev/null \
+        || { echo "stamp-version: this script has uncommitted edits -- commit them first" >&2; exit 1; }
+    _sv_desc=$(git -c safe.directory='*' -C "$_sv_dir" describe --tags --long 2>/dev/null)
+    _sv_tmp=$(mktemp "${TMPDIR:-/tmp}/my-power.stamp.XXXXXX") || { echo "stamp-version: mktemp failed" >&2; exit 1; }
+    cp -p "$_sv_self" "$_sv_tmp" 2>/dev/null
+    sed -e "s|^SCRIPT_COMMIT=.*|SCRIPT_COMMIT=\"$_sv_sha\"|" \
+        -e "s|^SCRIPT_RELEASE=.*|SCRIPT_RELEASE=\"$_sv_desc\"|" "$_sv_self" > "$_sv_tmp" \
+        || { rm -f "$_sv_tmp"; echo "stamp-version: could not rewrite the stamp" >&2; exit 1; }
+    grep -q "^SCRIPT_COMMIT=\"$_sv_sha\"\$" "$_sv_tmp" \
+        || { rm -f "$_sv_tmp"; echo "stamp-version: the rewritten file carries no stamp -- refusing to install it" >&2; exit 1; }
+    mv -f "$_sv_tmp" "$_sv_self" || { rm -f "$_sv_tmp"; echo "stamp-version: could not install the stamped file" >&2; exit 1; }
+    git -C "$_sv_dir" add -- "$(basename "$0")" || { echo "stamp-version: git add failed" >&2; exit 1; }
+    git -C "$_sv_dir" commit -q --amend --no-edit || { echo "stamp-version: git amend failed" >&2; exit 1; }
+    printf 'stamped SCRIPT_COMMIT=%s SCRIPT_RELEASE=%s -- HEAD is now %s\n' \
+        "$_sv_sha" "${_sv_desc:-<no tag yet>}" "$(git -C "$_sv_dir" rev-parse --short HEAD)"
+    printf '  > the stamped sha lags HEAD by one: amending changes it. Tag AFTER this.\n'
+}
 
 # ----------------------------------------------------------------------------
 # DEFAULTS (overridable by config file)
@@ -207,7 +290,9 @@ GLOBAL OPTS:
                             protects ALL selectors, including #N and by-name).
     -y | --yes              Don't prompt for confirmation on destructive ops.
     -h | --help             This help.
-    -V | --version          Print version.
+    -V | --version          Print version, release state and build id.
+    stamp-version           Record this commit + 'git describe' in the file
+                            and amend, so a deployed copy can say what it is.
 
 CONFIG SEARCH ORDER (first hit wins):
     /LINKS/default/$PROG.conf   (or /LINKS/default/$PROG)
@@ -1783,7 +1868,8 @@ parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)    usage; exit 0 ;;
-            -V|--version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+            -V|--version) _version_string; exit 0 ;;
+            stamp-version) _stamp_version; exit 0 ;;
             -D|--debug)   DEBUG=1; shift ;;
             -n|--dry-run) DRY_RUN=1; shift ;;
             -f|--force)   FORCE=1; shift ;;
