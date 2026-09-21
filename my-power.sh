@@ -42,8 +42,8 @@ PROG="my-power-doctor"
 # tag>-<commits since it>-g<short sha>); both are written by 'stamp-version',
 # so a deployed copy with no git can still say what it is.
 VERSION="1.5.2"
-SCRIPT_COMMIT="af4a2d6"
-SCRIPT_RELEASE="v1.5.2-6-gaf4a2d6"
+SCRIPT_COMMIT="57417d8"
+SCRIPT_RELEASE="v1.5.2-7-g57417d8"
 
 # The first 12 hex of this file's own SHA-256: the value that identifies the
 # bytes, so comparing two installs is running --version on each and diffing.
@@ -124,6 +124,11 @@ _stamp_version() {
         echo "stamp-version: HEAD $_sv_sha is already pushed -- amending it would rewrite published history. Commit, stamp, THEN push." >&2
         exit 1
     fi
+    # The repo may be SHARED -- other sessions commit here too -- and an amend
+    # rewrites whatever HEAD happens to be. Stamp only the commit that carries
+    # THIS file: if HEAD does not touch it, HEAD is somebody else's work.
+    [ -n "$(git -C "$_sv_dir" show --name-only --format= HEAD -- "$(basename "$0")" 2>/dev/null)" ] \
+       || { echo "stamp-version: HEAD does not touch this file -- it is not this file's commit (commit it first; in a shared repo the amend would rewrite someone else's)." >&2; exit 1; }
     _sv_staged=$(git -C "$_sv_dir" diff --cached --name-only 2>/dev/null)
     if [ -n "$_sv_staged" ]; then
         echo "stamp-version: something is staged -- the amend would fold it in:" >&2
