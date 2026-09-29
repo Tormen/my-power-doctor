@@ -79,7 +79,7 @@ _version_string() {
     _vs_d=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
     # describe answers about WHERE this file sits, not about what it is: a copy
     # dropped in a foreign repo gets THAT repo's tags (/LINKS/global is one, and
-    # it holds the copies update-LINKS promotes). The stamped commit is the
+    # it holds the copies my-rollout promotes). The stamped commit is the
     # proof -- a repo that does not have it is not this tool's repo.
     if [ -n "$_vs_d" ] && [ -n "$SCRIPT_COMMIT" ] \
        && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
