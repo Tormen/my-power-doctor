@@ -44,8 +44,8 @@ SITE_CONF="/LINKS/default/site.conf"   # the ONE site path in this tool: read_si
 # tag>-<commits since it>-g<short sha>); both are written by 'stamp-version',
 # so a deployed copy with no git can still say what it is.
 VERSION="1.5.2"
-SCRIPT_COMMIT="c44a8b9"
-SCRIPT_RELEASE="v1.5.2-9-gc44a8b9"
+SCRIPT_COMMIT="d5f66ba"
+SCRIPT_RELEASE="v1.5.2-10-gd5f66ba"
 
 # The first 12 hex of this file's own SHA-256: the value that identifies the
 # bytes, so comparing two installs is running --version on each and diffing.
@@ -380,6 +380,22 @@ WHITELIST="WindowServer loginwindow coreaudiod hidd \
 EOF
 }
 
+# sh: 0 not there, 1 there ([ -r ] it: unreadable is the error), 2 cannot tell
+site_absent() {
+	_sa_p=$1
+	[ -e "$_sa_p" ] && return 1
+	[ -L "$_sa_p" ] && return 2
+	while :; do
+		_sa_d=$(dirname -- "$_sa_p")
+		[ "$_sa_d" = "$_sa_p" ] && return 0
+		if [ -e "$_sa_d" ] || [ -L "$_sa_d" ]; then
+			[ -d "$_sa_d" ] && [ -x "$_sa_d" ] && return 0
+			return 2
+		fi
+		_sa_p=$_sa_d
+	done
+}
+
 # The site's values for every tool, from SITE_CONF -- the one site path this
 # tool knows. The neutral values first, so an exported variable never takes
 # their place; then the file's plain KEY="value" lines, when it is there.
@@ -390,7 +406,14 @@ read_site() {
     DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"
     CONFIG_SEARCH_DIR=""; CONFIG_OFFER_DIR=""; CONFIG_OFFER_NOTE=""
     SITE_ERR=""
-    [ -e "$SITE_CONF" ] || return 0
+    # cannot tell (a link to nothing, a folder on the way this user cannot
+    # search -- where [ -e ] says "no") is the same error as unreadable
+    site_absent "$SITE_CONF"
+    case $? in
+        0) return 0 ;;
+        2) SITE_ERR="cannot tell whether '$SITE_CONF' is there (a link to nothing, or a folder on the way it cannot search) -- the site's directories for every tool; its group must include $(id -un)"
+           return 1 ;;
+    esac
     if [ ! -r "$SITE_CONF" ]; then
         SITE_ERR="cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $(id -un)"
         return 1
@@ -1944,6 +1967,7 @@ action_restore() {
 # Each test builds its own world in a temp dir and checks it in a subshell.
 # ----------------------------------------------------------------------------
 TESTS="t_site_conf_gives_the_bases_the_search_and_the_offer \
+       t_site_conf_there_but_unreadable_is_an_error \
        t_config_offer_names_only_searched_paths \
        t_config_found_in_the_site_search_dir_under_either_name \
        t_help_shows_the_sites_search_and_offer \
@@ -1992,6 +2016,35 @@ t_site_conf_gives_the_bases_the_search_and_the_offer() {
         esac
         chmod 600 "$T_DIR/site.conf"
     fi
+    [ -z "$_bad" ] || { printf '%s\n' "$_bad" | sed '/^$/d'; return 1; }
+}
+
+# The site file behind a folder this user cannot search, or a link to
+# nothing: an error, never the neutral values -- [ -e ] answers "no" there.
+# Absent: the neutral values.
+# shellcheck disable=SC2030,SC2031  # each check runs in a subshell of its own, on purpose
+t_site_conf_there_but_unreadable_is_an_error() {
+    mkdir "$T_DIR/locked"
+    printf '%s\n' 'DATA_BASE_DIR="/srv/data"' > "$T_DIR/locked/site.conf"
+    ln -s "$T_DIR/nowhere" "$T_DIR/link.conf"
+    _w="$T_DIR/link.conf"
+    # root searches a mode-000 folder, so only a user can see that refusal
+    if [ "$(id -u)" -ne 0 ]; then
+        chmod 000 "$T_DIR/locked"; _w="$T_DIR/locked/site.conf $_w"
+    fi
+    _bad=""
+    for _p in $_w; do
+        _o=$( (SITE_CONF=$_p; read_site; printf '%s|%s|%s' "$?" "$DATA_BASE_DIR" "$SITE_ERR") 2>&1)
+        case "$_o" in
+            "1|/var/db|cannot tell whether '$_p' is there"*) ;;
+            *) _bad="$_bad
+# $_p: got '$_o', want rc 1 and the error, not the neutral values in silence" ;;
+        esac
+    done
+    chmod 700 "$T_DIR/locked"
+    _o=$( (SITE_CONF="$T_DIR/absent/site.conf"; read_site; printf '%s|%s|%s' "$?" "$DATA_BASE_DIR" "$SITE_ERR") 2>&1)
+    [ "$_o" = "0|/var/db|" ] || _bad="$_bad
+# absent: got '$_o', want '0|/var/db|'"
     [ -z "$_bad" ] || { printf '%s\n' "$_bad" | sed '/^$/d'; return 1; }
 }
 
