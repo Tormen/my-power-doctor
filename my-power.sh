@@ -27,7 +27,8 @@
 #   <label>             launchd label (e.g. com.apple.rapportd)
 #
 # Klaus conventions:
-#   - Config search:  /LINKS/default → ~/ → /etc → /usr/local/etc (first hit)
+#   - site.conf first (see read_site), then the config:
+#     the site's search dir → ~/ → /etc → /usr/local/etc (first hit)
 #   - --config PATH      override resolved config (and print it)
 #   - --create-config [PATH]   write default to PATH or stdout (never auto-writes)
 #   - -D | --debug       log to debug file (configurable)
@@ -36,14 +37,15 @@
 set -u
 
 PROG="my-power-doctor"
+SITE_CONF="/LINKS/default/site.conf"   # the ONE site path in this tool: read_site
 # VERSION names the release these bytes are BASED on -- only a release commit
 # sets it. SCRIPT_COMMIT is the commit this file was released from and
 # SCRIPT_RELEASE what 'git describe --tags --long' said then (<nearest
 # tag>-<commits since it>-g<short sha>); both are written by 'stamp-version',
 # so a deployed copy with no git can still say what it is.
 VERSION="1.5.2"
-SCRIPT_COMMIT="57417d8"
-SCRIPT_RELEASE="v1.5.2-7-g57417d8"
+SCRIPT_COMMIT="c44a8b9"
+SCRIPT_RELEASE="v1.5.2-9-gc44a8b9"
 
 # The first 12 hex of this file's own SHA-256: the value that identifies the
 # bytes, so comparing two installs is running --version on each and diffing.
@@ -157,22 +159,8 @@ _stamp_version() {
 # DEFAULTS (overridable by config file)
 # ----------------------------------------------------------------------------
 
-# State directory: where we record what we've disabled so we can restore.
-# Root invocations use /var/db; user invocations use ~/.
-if [ "$(id -u)" -eq 0 ]; then
-    DEFAULT_STATE_DIR="/var/db/my-power-doctor"
-else
-    DEFAULT_STATE_DIR="${HOME}/.my-power-doctor"
-fi
-STATE_DIR="$DEFAULT_STATE_DIR"
-
-# Debug log
-if [ "$(id -u)" -eq 0 ]; then
-    DEFAULT_DEBUG_LOG="/var/log/my-power-doctor.log"
-else
-    DEFAULT_DEBUG_LOG="${HOME}/.my-power-doctor.log"
-fi
-DEBUG_LOG="$DEFAULT_DEBUG_LOG"
+# STATE_DIR (where we record what we've disabled so we can restore) and
+# DEBUG_LOG lie under the site's bases: site_defaults, once read_site ran.
 
 # Which assertion types we treat as "blocks sleep". Space-separated.
 # Display-sleep blockers are listed too but flagged differently.
@@ -195,10 +183,6 @@ WAKE_HISTORY_LINES=40
 # pmset log regardless of age.
 WAKE_HISTORY_EVENTS=10
 
-# Config file resolution (first existing wins)
-# both spellings are accepted under /LINKS/default: .conf first, then bare
-CONFIG_SEARCH="/LINKS/default/my-power-doctor.conf /LINKS/default/my-power-doctor ${HOME}/.my-power-doctor.conf /etc/my-power-doctor.conf /usr/local/etc/my-power-doctor.conf"
-
 # ----------------------------------------------------------------------------
 # Runtime state
 # ----------------------------------------------------------------------------
@@ -207,6 +191,7 @@ DRY_RUN=0
 FORCE=0                  # --force: act on whitelisted rows
 CONFIG_FILE=""           # resolved
 CONFIG_FILE_ARG=""       # if user gave --config
+SITE_ERR=""              # read_site: why the site file could not be read
 ACTION=""
 SELECTOR=""
 SET_KNOB=""              # 'set' action: knob short-name
@@ -325,12 +310,17 @@ GLOBAL OPTS:
     -V | --version          Print version, release state and build id.
     stamp-version           Record this commit + 'git describe' in the file
                             and amend, so a deployed copy can say what it is.
+    --run-tests [FILTER]    Run the built-in tests (TAP); FILTER: only those
+                            whose name contains it.
+
+SITE ($SITE_CONF, read first when there -- its DATA_BASE_DIR,
+LOG_BASE_DIR and CONFIG_SEARCH_DIR; /var/db and /var/log without it):
+    state dir:  <DATA_BASE_DIR>/<user>/$PROG   here: $STATE_DIR
+    debug log:  <LOG_BASE_DIR>/<user>/$PROG.log   here: $DEBUG_LOG
+    (STATE_DIR / DEBUG_LOG in the config override both)
 
 CONFIG SEARCH ORDER (first hit wins):
-    /LINKS/default/$PROG.conf   (or /LINKS/default/$PROG)
-    ~/.$PROG.conf
-    /etc/$PROG.conf
-    /usr/local/etc/$PROG.conf
+$(config_search_paths | sed 's/^/    /')
 
 EXAMPLES:
     $PROG                                  # default: culprits + state
@@ -342,12 +332,13 @@ EXAMPLES:
     sudo $PROG prevent com.apple.rapportd  # by label
     sudo $PROG restore 1                   # row 1 of 'state' list
     sudo $PROG restore all
-    $PROG --create-config /LINKS/default/$PROG.conf
+$(config_offer_lines | sed -n 1p)
 
 EXIT STATUS:
     0  ok                 1  generic error
     2  usage error        3  no blockers found / nothing to do
 EOF
+    [ -z "$SITE_ERR" ] || printf '\n!!! %s\n' "$SITE_ERR"
 }
 
 # ----------------------------------------------------------------------------
@@ -359,13 +350,11 @@ print_default_config() {
 #
 # All values are optional; commented entries show defaults.
 
-# State directory (where we record disabled services for restore)
-# STATE_DIR="/var/db/my-power-doctor"             # when run as root
-# STATE_DIR="${HOME}/.my-power-doctor"            # when run as user
-
-# Debug log location
-# DEBUG_LOG="/var/log/my-power-doctor.log"        # when run as root
-# DEBUG_LOG="${HOME}/.my-power-doctor.log"        # when run as user
+# State directory (where we record disabled services for restore) and debug
+# log. DATA_BASE_DIR / LOG_BASE_DIR come from the site file
+# (/LINKS/default/site.conf; /var/db and /var/log without it).
+# STATE_DIR="$DATA_BASE_DIR/$(id -un)/my-power-doctor"
+# DEBUG_LOG="$LOG_BASE_DIR/$(id -un)/my-power-doctor.log"
 
 # Assertion types that "block sleep" (system / display)
 # SLEEP_ASSERTIONS="PreventUserIdleSystemSleep PreventSystemSleep NoIdleSleepAssertion"
@@ -391,6 +380,61 @@ WHITELIST="WindowServer loginwindow coreaudiod hidd \
 EOF
 }
 
+# The site's values for every tool, from SITE_CONF -- the one site path this
+# tool knows. The neutral values first, so an exported variable never takes
+# their place; then the file's plain KEY="value" lines, when it is there.
+# There but unreadable is an error (SITE_ERR, returns 1), never the neutral
+# values: they would keep this user's state apart from everyone else's. The
+# caller decides when to die, so --help still works on a broken site.
+read_site() {
+    DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"
+    CONFIG_SEARCH_DIR=""; CONFIG_OFFER_DIR=""; CONFIG_OFFER_NOTE=""
+    SITE_ERR=""
+    [ -e "$SITE_CONF" ] || return 0
+    if [ ! -r "$SITE_CONF" ]; then
+        SITE_ERR="cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $(id -un)"
+        return 1
+    fi
+    # shellcheck disable=SC1090  # the site file's path is a variable (tests point it elsewhere)
+    . "$SITE_CONF" || { SITE_ERR="'$SITE_CONF' failed to load"; return 1; }
+}
+
+# The defaults that lie under the site's bases: the user it runs as, then
+# this tool. The config, loaded after, may set either.
+site_defaults() {
+    STATE_DIR="$DATA_BASE_DIR/$(id -un)/$PROG"
+    DEBUG_LOG="$LOG_BASE_DIR/$(id -un)/$PROG.log"
+}
+
+# Where the config is looked for, first hit wins: the site's search directory
+# (both spellings, .conf first), then ~, /etc, /usr/local/etc.
+config_search_paths() {
+    [ -z "$CONFIG_SEARCH_DIR" ] || printf '%s\n' "$CONFIG_SEARCH_DIR/$PROG.conf" "$CONFIG_SEARCH_DIR/$PROG"
+    printf '%s\n' "$HOME/.$PROG.conf" "/etc/$PROG.conf" "/usr/local/etc/$PROG.conf"
+}
+
+# Where to write a config, most common place first: the site's offer
+# directory -- only where the site's search directory is searched, which a
+# file there reaches as the note says; never the search directory itself, a
+# farm -- then /etc, then ~. Only paths the search reads.
+config_offer_paths() {
+    if [ -n "$CONFIG_OFFER_DIR" ] && [ -n "$CONFIG_SEARCH_DIR" ]; then printf '%s\n' "$CONFIG_OFFER_DIR/$PROG.conf"; fi
+    for _o in "/etc/$PROG.conf" "$HOME/.$PROG.conf"; do
+        config_search_paths | grep -qxF "$_o" && printf '%s\n' "$_o"
+    done
+}
+
+# Each offered place as a paste-ready line, the site's note beside its own.
+config_offer_lines() {
+    config_offer_paths | while IFS= read -r _o; do
+        if [ "$_o" = "$CONFIG_OFFER_DIR/$PROG.conf" ] && [ -n "$CONFIG_OFFER_NOTE" ]; then
+            printf '    %s --create-config %s   (%s)\n' "$PROG" "$_o" "$CONFIG_OFFER_NOTE"
+        else
+            printf '    %s --create-config %s\n' "$PROG" "$_o"
+        fi
+    done
+}
+
 resolve_config() {
     # If user passed --config <PATH>, use that (must exist).
     if [ -n "$CONFIG_FILE_ARG" ]; then
@@ -399,13 +443,15 @@ resolve_config() {
         return 0
     fi
     # Otherwise walk the search path.
-    for _f in $CONFIG_SEARCH; do
+    CONFIG_FILE=""
+    while IFS= read -r _f; do
         if [ -f "$_f" ]; then
             CONFIG_FILE="$_f"
             return 0
         fi
-    done
-    CONFIG_FILE=""
+    done <<_EOF
+$(config_search_paths)
+_EOF
 }
 
 load_config() {
@@ -1894,6 +1940,161 @@ action_restore() {
 }
 
 # ----------------------------------------------------------------------------
+# TESTS (--run-tests [FILTER]) -- TAP: the plan first, then one line per test.
+# Each test builds its own world in a temp dir and checks it in a subshell.
+# ----------------------------------------------------------------------------
+TESTS="t_site_conf_gives_the_bases_the_search_and_the_offer \
+       t_config_offer_names_only_searched_paths \
+       t_config_found_in_the_site_search_dir_under_either_name \
+       t_help_shows_the_sites_search_and_offer \
+       t_every_test_is_in_the_run_list"
+
+# _t_site DIR [offer-only]  -- a site file in DIR, every key or the offer only
+_t_site() {
+    if [ "${2:-}" = offer-only ]; then
+        printf '%s\n' "CONFIG_OFFER_DIR=\"$1/global\"" > "$1/site.conf"
+    else
+        printf '%s\n' 'DATA_BASE_DIR="/srv/data"' 'LOG_BASE_DIR="/srv/log"' \
+            "CONFIG_SEARCH_DIR=\"$1/farm\"" "CONFIG_OFFER_DIR=\"$1/global\"" \
+            'CONFIG_OFFER_NOTE="linked there by a run"' > "$1/site.conf"
+    fi
+}
+
+# The bases, the search and the offer come from the site file; without it the
+# neutral values hold even when the same names are exported; unreadable is an
+# error, never the neutral values.
+# shellcheck disable=SC2030,SC2031  # each check runs in a subshell of its own, on purpose
+t_site_conf_gives_the_bases_the_search_and_the_offer() {
+    _u=$(id -un); _bad=""
+    _t_site "$T_DIR"
+    _o=$( (SITE_CONF="$T_DIR/site.conf"; read_site; site_defaults
+           printf '%s|%s|%s|%s' "$STATE_DIR" "$DEBUG_LOG" "$(config_search_paths | sed -n 1p)" \
+                  "$(config_offer_lines | sed -n 1p)") 2>&1)
+    _w="/srv/data/$_u/$PROG|/srv/log/$_u/$PROG.log|$T_DIR/farm/$PROG.conf|    $PROG --create-config $T_DIR/global/$PROG.conf   (linked there by a run)"
+    [ "$_o" = "$_w" ] || _bad="$_bad
+# site:    got '$_o'
+#          want '$_w'"
+    _o=$( (DATA_BASE_DIR=/elsewhere; CONFIG_SEARCH_DIR=/elsewhere; export DATA_BASE_DIR CONFIG_SEARCH_DIR
+           SITE_CONF="$T_DIR/none"; read_site; site_defaults
+           printf '%s|%s' "$STATE_DIR" "$(config_search_paths | sed -n 1p)") 2>&1)
+    _w="/var/db/$_u/$PROG|$HOME/.$PROG.conf"
+    [ "$_o" = "$_w" ] || _bad="$_bad
+# no site: got '$_o'
+#          want '$_w'"
+    # root reads a mode-000 file, so only a user can see the refusal
+    if [ "$(id -u)" -ne 0 ]; then
+        chmod 000 "$T_DIR/site.conf"
+        _o=$( (SITE_CONF="$T_DIR/site.conf"; read_site; printf '%s|%s' "$?" "$DATA_BASE_DIR") 2>&1)
+        case "$_o" in
+            "1|/var/db") ;;
+            *) _bad="$_bad
+# unreadable: got '$_o', want '1|/var/db' (an error, not the site's values)" ;;
+        esac
+        chmod 600 "$T_DIR/site.conf"
+    fi
+    [ -z "$_bad" ] || { printf '%s\n' "$_bad" | sed '/^$/d'; return 1; }
+}
+
+# Prints each offered path the search does not read ("orphan:"), then
+# "site-offer" when the site's offer is there, "offers-the-farm" when the
+# search directory itself is offered.
+_t_offer_report() {
+    _s=$(config_search_paths)
+    config_offer_paths | while IFS= read -r _p; do
+        case "$_p" in
+            # the site's offer reaches the search through the farm
+            "$T_DIR/global/$PROG.conf") printf '%s\n' "$_s" | grep -qxF "$T_DIR/farm/$PROG.conf" || echo "orphan:$_p" ;;
+            *) printf '%s\n' "$_s" | grep -qxF "$_p" || echo "orphan:$_p" ;;
+        esac
+    done
+    config_offer_paths | grep -qxF "$T_DIR/global/$PROG.conf" && echo "site-offer"
+    config_offer_paths | grep -q "^$T_DIR/farm/" && echo "offers-the-farm"
+    return 0
+}
+
+# Every offered place is one the search reads; the site's offer only where
+# its search directory is searched.
+t_config_offer_names_only_searched_paths() {
+    _bad=""
+    for _with in site none offer-only; do
+        rm -f "$T_DIR/site.conf"
+        case "$_with" in
+            site)       _t_site "$T_DIR" ;;
+            offer-only) _t_site "$T_DIR" offer-only ;;
+        esac
+        # a function, not inline: bash 3.2 (macOS /bin/sh) cannot parse a
+        # case inside $( )
+        _o=$( (SITE_CONF="$T_DIR/site.conf"; read_site; _t_offer_report) 2>&1)
+        case "$_with:$_o" in
+            site:site-offer|none:|offer-only:) ;;
+            *) _bad="$_bad
+# $_with: got '$(printf '%s' "$_o" | tr '\n' ' ')'" ;;
+        esac
+    done
+    [ -z "$_bad" ] || { printf '%s\n' "$_bad" | sed '/^$/d'; return 1; }
+}
+
+# The site's search directory is read under both names, .conf first.
+# shellcheck disable=SC2030  # each check sets its own site in a subshell, on purpose
+t_config_found_in_the_site_search_dir_under_either_name() {
+    _bad=""
+    _t_site "$T_DIR"; mkdir "$T_DIR/farm" "$T_DIR/home"
+    : > "$T_DIR/farm/$PROG"
+    _o=$( (HOME="$T_DIR/home"; SITE_CONF="$T_DIR/site.conf"; read_site; resolve_config; printf '%s' "$CONFIG_FILE") 2>&1)
+    [ "$_o" = "$T_DIR/farm/$PROG" ] || _bad="$_bad
+# bare name: got '$_o'"
+    : > "$T_DIR/farm/$PROG.conf"
+    _o=$( (HOME="$T_DIR/home"; SITE_CONF="$T_DIR/site.conf"; read_site; resolve_config; printf '%s' "$CONFIG_FILE") 2>&1)
+    [ "$_o" = "$T_DIR/farm/$PROG.conf" ] || _bad="$_bad
+# both names: got '$_o', want the .conf"
+    [ -z "$_bad" ] || { printf '%s\n' "$_bad" | sed '/^$/d'; return 1; }
+}
+
+# --help names the site's search directory and offer, never a fixed one.
+# shellcheck disable=SC2031  # reads the real SITE_CONF on purpose; the checks set theirs in subshells
+t_help_shows_the_sites_search_and_offer() {
+    _t_site "$T_DIR"
+    _real=$(dirname "$SITE_CONF")   # the real site file's directory, before the test's
+    _o=$( (SITE_CONF="$T_DIR/site.conf"; read_site; site_defaults; usage) 2>&1)
+    _bad=""
+    printf '%s\n' "$_o" | grep -qxF "    $T_DIR/farm/$PROG.conf" || _bad="$_bad search"
+    printf '%s\n' "$_o" | grep -qF "create-config $T_DIR/global/$PROG.conf" || _bad="$_bad offer"
+    printf '%s\n' "$_o" | grep -qF "here: /srv/data/" || _bad="$_bad state-dir"
+    # it must not show through the test's site
+    printf '%s\n' "$_o" | grep -qF "$_real/$PROG" && _bad="$_bad fixed-path"
+    [ -z "$_bad" ] || { echo "# --help lacks or has:$_bad"; return 1; }
+}
+
+t_every_test_is_in_the_run_list() {
+    _defined=$(grep -c '^t_[a-z_]*() {' "$0")
+    # shellcheck disable=SC2086  # TESTS is a word list
+    _listed=$(printf '%s\n' $TESTS | grep -c .)
+    [ "$_defined" = "$_listed" ] || { echo "# $_defined test functions, $_listed in TESTS"; return 1; }
+}
+
+run_tests() { # [FILTER]
+    _rt_sel=""
+    for _rt_t in $TESTS; do
+        case "$_rt_t" in *"${1:-}"*) _rt_sel="$_rt_sel $_rt_t" ;; esac
+    done
+    [ -n "$_rt_sel" ] || { echo "$PROG: no test matches '${1:-}'" >&2; return 1; }
+    _rt_n=0; for _rt_t in $_rt_sel; do _rt_n=$((_rt_n + 1)); done
+    echo "1..$_rt_n"
+    _rt_k=0; _rt_fail=0
+    for _rt_t in $_rt_sel; do
+        _rt_k=$((_rt_k + 1))
+        T_DIR=$(mktemp -d "${TMPDIR:-/tmp}/$PROG-tests.XXXXXX") || return 1
+        if ( "$_rt_t" ); then
+            echo "ok $_rt_k - $_rt_t"
+        else
+            echo "not ok $_rt_k - $_rt_t"; _rt_fail=$((_rt_fail + 1))
+        fi
+        rm -rf "$T_DIR"
+    done
+    [ "$_rt_fail" -eq 0 ]
+}
+
+# ----------------------------------------------------------------------------
 # ARG PARSING
 # ----------------------------------------------------------------------------
 parse_args() {
@@ -1902,6 +2103,7 @@ parse_args() {
             -h|--help)    usage; exit 0 ;;
             -V|--version) _version_string; exit 0 ;;
             stamp-version) _stamp_version; exit 0 ;;
+            --run-tests)  run_tests "${2:-}"; exit $? ;;
             -D|--debug)   DEBUG=1; shift ;;
             -n|--dry-run) DRY_RUN=1; shift ;;
             -f|--force)   FORCE=1; shift ;;
@@ -1979,10 +2181,19 @@ parse_args() {
 # MAIN
 # ----------------------------------------------------------------------------
 main() {
+    # The site first: --help shows the search order and directories it
+    # gives, and still works when the site file is broken (it says so).
+    read_site || :
+    site_defaults
     parse_args "$@"
+    [ -z "$SITE_ERR" ] || die "$SITE_ERR"
     need_macos
     resolve_config
     load_config
+    if [ "$DEBUG" -eq 1 ]; then
+        mkdir -p "$(dirname "$DEBUG_LOG")" 2>/dev/null
+        : >> "$DEBUG_LOG" 2>/dev/null || warn "cannot write the debug log $DEBUG_LOG -- set DEBUG_LOG in the config"
+    fi
 
     # If --config was used, announce resolved path.
     if [ -n "$CONFIG_FILE_ARG" ]; then

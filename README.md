@@ -155,8 +155,8 @@ my-power-doctor wake-history          # narrative timeline of last 10 power even
 my-power-doctor wake-history-raw      # raw pmset log lines (escape hatch)
 sudo my-power-doctor                  # +real wake-reason summary (root only)
 
-# write the default config to your /LINKS/default
-my-power-doctor --create-config /LINKS/default/my-power-doctor.conf
+# write the default config (--help names the most common place first)
+my-power-doctor --create-config /etc/my-power-doctor.conf
 
 # now act
 sudo my-power-doctor kill rapportd            # one-shot, will restart
@@ -173,14 +173,31 @@ sudo my-power-doctor prevent all
 
 ## Config
 
+### Site file
+
+`/LINKS/default/site.conf`, when it exists, is read first (plain
+`KEY="value"` lines). It gives the site's directories for every tool:
+
+| key | used as | without the file |
+|---|---|---|
+| `DATA_BASE_DIR` | state: `<DATA_BASE_DIR>/<user>/my-power-doctor/` | `/var/db` |
+| `LOG_BASE_DIR` | debug log: `<LOG_BASE_DIR>/<user>/my-power-doctor.log` | `/var/log` |
+| `CONFIG_SEARCH_DIR` | searched first for the config | not searched |
+| `CONFIG_OFFER_DIR`, `CONFIG_OFFER_NOTE` | where `--help` suggests writing a config | not suggested |
+
+`<user>` is the user it runs as (`root` under sudo). There but unreadable is
+an error. `STATE_DIR` / `DEBUG_LOG` in the config override both directories.
+
 ### Search order (first existing file wins)
 
 ```
-/LINKS/default/my-power-doctor.conf
+$CONFIG_SEARCH_DIR/my-power-doctor.conf   (then the bare my-power-doctor)
 ~/.my-power-doctor.conf
 /etc/my-power-doctor.conf
 /usr/local/etc/my-power-doctor.conf
 ```
+
+`--help` prints the order with this machine's values.
 
 ### Flags
 
@@ -194,17 +211,17 @@ sudo my-power-doctor prevent all
 - `-f | --force` — act on whitelisted rows too. Required to touch any
   row marked `W` in the culprits table. The override is loudly logged.
 - `-y | --yes` — skip confirmation prompts.
+- `--run-tests [FILTER]` — run the built-in tests (TAP); FILTER keeps those
+  whose name contains it.
 
 ### Config file (sourced as POSIX sh)
 
 ```sh
-# State directory (where prevented services are recorded for restore)
-# STATE_DIR="/var/db/my-power-doctor"             # when run as root
-# STATE_DIR="${HOME}/.my-power-doctor"            # when run as user
-
-# Debug log location
-# DEBUG_LOG="/var/log/my-power-doctor.log"        # when run as root
-# DEBUG_LOG="${HOME}/.my-power-doctor.log"        # when run as user
+# State directory (where prevented services are recorded for restore) and
+# debug log. DATA_BASE_DIR / LOG_BASE_DIR come from the site file
+# (/LINKS/default/site.conf; /var/db and /var/log without it).
+# STATE_DIR="$DATA_BASE_DIR/$(id -un)/my-power-doctor"
+# DEBUG_LOG="$LOG_BASE_DIR/$(id -un)/my-power-doctor.log"
 
 # Assertion types treated as "blocks sleep"
 # SLEEP_ASSERTIONS="PreventUserIdleSystemSleep PreventSystemSleep NoIdleSleepAssertion"
@@ -335,13 +352,10 @@ sudo my-power-doctor -n prevent all       # show what would happen, do nothing
 
 ```
 /usr/local/bin/my-power-doctor
-/LINKS/default/my-power-doctor.conf       (recommended canonical config)
-/var/log/my-power-doctor.log              (debug, when run as root)
-/var/db/my-power-doctor/disabled.tsv      (state, when run as root)
-/var/db/my-power-doctor/last-culprits.tsv (cache of last culprits list)
-~/.my-power-doctor.log                    (debug, when run as user)
-~/.my-power-doctor/disabled.tsv           (state, when run as user)
-~/.my-power-doctor/last-culprits.tsv      (cache of last culprits list)
+/LINKS/default/site.conf                          (the site's directories, when there)
+<DATA_BASE_DIR>/<user>/my-power-doctor/disabled.tsv       (state)
+<DATA_BASE_DIR>/<user>/my-power-doctor/last-culprits.tsv  (cache of last culprits list)
+<LOG_BASE_DIR>/<user>/my-power-doctor.log                 (debug)
 ```
 
 State file format (TSV):
