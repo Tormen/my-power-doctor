@@ -44,8 +44,8 @@ SITE_CONF="/LINKS/default/site.conf"   # the ONE site path in this tool: read_si
 # tag>-<commits since it>-g<short sha>); both are written by 'stamp-version',
 # so a deployed copy with no git can still say what it is.
 VERSION="1.5.2"
-SCRIPT_COMMIT="d5f66ba"
-SCRIPT_RELEASE="v1.5.2-10-gd5f66ba"
+SCRIPT_COMMIT="77451bd"
+SCRIPT_RELEASE="v1.0.0-21-g77451bd"
 
 # The first 12 hex of this file's own SHA-256: the value that identifies the
 # bytes, so comparing two installs is running --version on each and diffing.
@@ -381,19 +381,16 @@ EOF
 }
 
 # sh: 0 not there, 1 there ([ -r ] it: unreadable is the error), 2 cannot tell
+# Judged by the system's own answer, never by mode bits: macOS can refuse a
+# look the bits allow (TCC). On 2, _sa_m says why, for the error message.
 site_absent() {
-	_sa_p=$1
-	[ -e "$_sa_p" ] && return 1
-	[ -L "$_sa_p" ] && return 2
-	while :; do
-		_sa_d=$(dirname -- "$_sa_p")
-		[ "$_sa_d" = "$_sa_p" ] && return 0
-		if [ -e "$_sa_d" ] || [ -L "$_sa_d" ]; then
-			[ -d "$_sa_d" ] && [ -x "$_sa_d" ] && return 0
-			return 2
-		fi
-		_sa_p=$_sa_d
-	done
+	[ -e "$1" ] && return 1
+	_sa_m=$(LC_ALL=C ls -d -- "$1" 2>&1 > /dev/null)
+	case $_sa_m in *": No such file or directory") return 0 ;; esac
+	if [ -n "$_sa_m" ]; then _sa_m="the system says: ${_sa_m##*: }"
+	elif [ -L "$1" ]; then _sa_m="a link to nothing"
+	else _sa_m="listed, but it cannot be looked at"; fi
+	return 2
 }
 
 # The site's values for every tool, from SITE_CONF -- the one site path this
@@ -411,7 +408,7 @@ read_site() {
     site_absent "$SITE_CONF"
     case $? in
         0) return 0 ;;
-        2) SITE_ERR="cannot tell whether '$SITE_CONF' is there (a link to nothing, or a folder on the way it cannot search) -- the site's directories for every tool; its group must include $(id -un)"
+        2) SITE_ERR="cannot tell whether '$SITE_CONF' is there ($_sa_m) -- the site's directories for every tool; its group must include $(id -un)"
            return 1 ;;
     esac
     if [ ! -r "$SITE_CONF" ]; then
@@ -1967,7 +1964,7 @@ action_restore() {
 # Each test builds its own world in a temp dir and checks it in a subshell.
 # ----------------------------------------------------------------------------
 TESTS="t_site_conf_gives_the_bases_the_search_and_the_offer \
-       t_site_conf_there_but_unreadable_is_an_error \
+       t_site_conf_there_but_unreadable_is_an_error t_site_conf_refused_by_the_system_is_an_error_whatever_the_mode_bits \
        t_config_offer_names_only_searched_paths \
        t_config_found_in_the_site_search_dir_under_either_name \
        t_help_shows_the_sites_search_and_offer \
@@ -2046,6 +2043,19 @@ t_site_conf_there_but_unreadable_is_an_error() {
     [ "$_o" = "0|/var/db|" ] || _bad="$_bad
 # absent: got '$_o', want '0|/var/db|'"
     [ -z "$_bad" ] || { printf '%s\n' "$_bad" | sed '/^$/d'; return 1; }
+}
+# A look the system refuses although the mode bits allow it (macOS TCC):
+# SITE_ERR names the system's answer -- never the neutral values in silence.
+# ls stands in for the kernel's answer.
+t_site_conf_refused_by_the_system_is_an_error_whatever_the_mode_bits() {
+    mkdir "$T_DIR/refused" "$T_DIR/fakebin"
+    # shellcheck disable=SC2016  # $3 belongs to the fake ls, expanded when it runs
+    printf '#!/bin/dash\necho "ls: $3: Operation not permitted" >&2\nexit 1\n' > "$T_DIR/fakebin/ls" && chmod 755 "$T_DIR/fakebin/ls"
+    _o=$( (SITE_CONF="$T_DIR/refused/site.conf"; PATH="$T_DIR/fakebin:/usr/bin:/bin" read_site; printf '%s|%s' "$?" "$SITE_ERR") 2>&1)
+    case "$_o" in
+        "1|cannot tell whether '$T_DIR/refused/site.conf' is there (the system says: Operation not permitted)"*) ;;
+        *) echo "# got '$_o', want rc 1 and the error naming the system's answer"; return 1 ;;
+    esac
 }
 
 # Prints each offered path the search does not read ("orphan:"), then
